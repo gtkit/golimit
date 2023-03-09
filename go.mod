@@ -1,5 +1,5 @@
-module gitlab.superjq.com/go-tools/golimit
+module github.com/gtkit/golimit
 
-go 1.17
+go 1.20
 
 require golang.org/x/time v0.1.0
