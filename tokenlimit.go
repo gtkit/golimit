@@ -25,10 +25,6 @@ var GlobalLimiters = &Limiters{
 
 var once = sync.Once{}
 
-func Allow(param string, num int) bool {
-	return NewLimiter(param, num).allow()
-}
-
 func NewLimiter(key string, b int) *Limiter {
 
 	once.Do(func() {
@@ -42,7 +38,7 @@ func NewLimiter(key string, b int) *Limiter {
 
 }
 
-func (l *Limiter) allow() bool {
+func (l *Limiter) Allow() bool {
 
 	l.lastGet = time.Now()
 
