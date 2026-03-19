@@ -40,6 +40,13 @@ func LimitIp(rps int) gin.HandlerFunc {
 // 注册中间件.
 r := gin.New()
 r.Use(LimitIp(100)) // 每个 IP+Path 每秒 100 个请求.
+
+// 实现不同路径不同速率
+api := r.Group("/api")
+api.Use(LimitIp(100)) // 通用接口 100/s.
+
+auth := r.Group("/auth")
+auth.Use(LimitIp(5)) // 登录接口 5/s.
 ```
 
 ## 工作原理
