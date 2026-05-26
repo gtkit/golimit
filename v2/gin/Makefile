@@ -22,7 +22,7 @@ test: ## race 测试 + count=1(禁缓存)
 	GOWORK=off go test -race -count=1 -timeout=5m ./...
 
 audit: ## 多 module 发版审计
-	bash ../scripts/check-modules.sh
+	bash ../../scripts/check-modules.sh
 
 ## release-check 是 tag 前的必跑质量门(全局规则 4).
 ## audit 是仓库级 advisory,不在此处包含 — 由顶层 release-check-all / release 单独跑.
@@ -41,13 +41,13 @@ tag: release-check ## 升 patch 版本并打 tag(自动跑 release-check 质量�
 	sed -E -i.bak 's/(const Version = ")([^"]+)(")/\1'"$$new"'\3/' version.go; \
 	rm -f version.go.bak; \
 	git add version.go; \
-	git commit -m "chore(release): v2 $$new"; \
+	git commit -m "chore(release): v2/gin $$new"; \
 	printf "Release: %s\n" "$$new"; \
 	git push gtkit HEAD; \
-	git tag -a "v2/$${new}" -m "release v2/$$new"; \
-	printf "Tag: v2/%s\n" "$$new"; \
-	git push gtkit "v2/$${new}"; \
+	git tag -a "v2/gin/$${new}" -m "release v2/gin/$$new"; \
+	printf "Tag: v2/gin/%s\n" "$$new"; \
+	git push gtkit "v2/gin/$${new}"; \
 	printf "Done\n"
 
-gittag: ## 显示 v2 最新 tag
-	git tag --sort=-version:refname | grep '^v2/' | head -1
+gittag: ## 显示 v2/gin 最新 tag
+	git tag --sort=-version:refname | grep '^v2/gin/' | head -1

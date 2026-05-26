@@ -2,21 +2,13 @@ package golimit
 
 import (
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/gin-gonic/gin"
 )
 
-func init() {
-	gin.SetMode(gin.TestMode)
-}
-
-// ================== Core Limiter Tests ==================
+// ================== 核心 Limiter 测试 ==================
 
 func TestAllow_Basic(t *testing.T) {
 	l := New(5)
@@ -79,14 +71,14 @@ func TestTokenRecovery(t *testing.T) {
 }
 
 func TestRateSemantic(t *testing.T) {
-	l := New(100) // 100 tokens/sec.
+	l := New(100) // 100 token/秒.
 	defer l.Close()
 
-	// Exhaust burst.
+	// 用尽 burst.
 	for range 100 {
 		l.Allow("k")
 	}
-	// Wait 100ms → should recover ~10 tokens.
+	// 等 100ms → 应补充 ~10 个令牌.
 	time.Sleep(100 * time.Millisecond)
 
 	allowed := 0
@@ -138,7 +130,7 @@ func TestTokens(t *testing.T) {
 	l := New(10)
 	defer l.Close()
 
-	// Unseen key returns full burst.
+	// 未见过的 key 应返回满 burst.
 	if tok := l.Tokens("new"); tok != 10 {
 		t.Errorf("unseen key should have burst tokens, got %f.", tok)
 	}
@@ -154,20 +146,330 @@ func TestClose(t *testing.T) {
 	l := New(100)
 	l.Allow("k")
 	l.Close()
-	// After Close, the cleanup goroutine should have exited.
-	// We just verify no panic or deadlock.
+	// Close 后清理 goroutine 应已退出.
+	// 这里仅验证不 panic 不死锁.
 }
 
 func TestZeroRate(t *testing.T) {
-	l := New(0) // Should use default 100.
+	l := New(0) // 应使用默认 rate=100.
 	defer l.Close()
 
 	if !l.Allow("k") {
-		t.Error("should use default rate=100 and allow the first request.")
+		t.Error("rps=0 应回退到默认 100,首次请求应通过.")
 	}
 }
 
-// ================== Concurrency Tests ==================
+// TestNewVisitorNotImmediatelyCleaned 是关键回归测试:新建 visitor 不应被立即清理.
+//
+// 隐患场景(v2.0.1 及之前):新建 visitor 时未 Store lastSeen → 默认 0 →
+// cleanup goroutine 抢先看到 lastSeen=0 < threshold → 立即删除 → 后续 Allow
+// 重新创建,burst 重置 → 绕过限流.
+//
+// 修复后:getOrCreate 创建时立即 Store lastSeen=Now,cleanup 不再误删新 visitor.
+func TestNewVisitorNotImmediatelyCleaned(t *testing.T) {
+	// 极激进配置:每 5ms 清理一次,空闲超 5ms 即过期.
+	l := New(100,
+		WithCleanupInterval(5*time.Millisecond),
+		WithMaxIdleTime(5*time.Millisecond),
+	)
+	defer l.Close()
+
+	// 创建 visitor 后立即查 Size — 应该 = 1,不应该被 cleanup 抢先删除.
+	l.Allow("k")
+	if got := l.Size(); got != 1 {
+		t.Fatalf("新建 visitor 后 Size 应为 1,实际 %d(可能被 cleanup 立即删除).", got)
+	}
+
+	// 紧密自旋:在多个 cleanup 周期内反复创建新 key,确保每个新 key 都不被即删.
+	for i := range 100 {
+		key := fmt.Sprintf("k%d", i)
+		l.Allow(key)
+		// 用 Tokens 间接验证 visitor 仍在(若被删除,会返回满 burst=100;若仍在,小于满 burst).
+		if tok := l.Tokens(key); tok >= float64(l.Burst()) {
+			t.Errorf("新建 visitor %s 在 Allow 后应已消耗 1 个 token,实际 Tokens=%v 等于 burst,可能被即删.", key, tok)
+		}
+	}
+}
+
+// TestNewVisitorNotImmediatelyCleaned_Concurrent 并发版本:多 goroutine 同时创建
+// + 短 cleanup 周期,确保 visitor 不会被 cleanup 与新建之间的 race 误删.
+func TestNewVisitorNotImmediatelyCleaned_Concurrent(t *testing.T) {
+	l := New(100,
+		WithCleanupInterval(1*time.Millisecond),
+		WithMaxIdleTime(1*time.Millisecond),
+	)
+	defer l.Close()
+
+	const goroutines = 100
+	var wg sync.WaitGroup
+	var brokenCount atomic.Int64
+
+	for i := range goroutines {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			key := fmt.Sprintf("concurrent-k%d", idx)
+			l.Allow(key)
+			// visitor 应至少存在到 cleanup 下一周期前 — 这里立即查,期望未被即删.
+			if tok := l.Tokens(key); tok >= float64(l.Burst()) {
+				brokenCount.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if got := brokenCount.Load(); got > 0 {
+		t.Errorf("%d / %d 个新建 visitor 被 cleanup 立即误删(Tokens 返回满 burst).", got, goroutines)
+	}
+}
+
+// TestWithCleanupInterval_ZeroSafe 验证 WithCleanupInterval(0) 不会让 New 内部
+// time.NewTicker(0) panic — 应被规范化为默认 1 分钟.
+func TestWithCleanupInterval_ZeroSafe(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("WithCleanupInterval(0) 不应导致 panic,实际 panic:%v.", r)
+		}
+	}()
+	l := New(10, WithCleanupInterval(0))
+	defer l.Close()
+
+	// 正常 Allow 应工作.
+	if !l.Allow("k") {
+		t.Error("修复 cleanupInterval=0 后基本功能应正常.")
+	}
+}
+
+// TestWithCleanupInterval_NegativeSafe 验证负数 cleanupInterval 也安全.
+func TestWithCleanupInterval_NegativeSafe(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("WithCleanupInterval(<0) 不应 panic,实际:%v.", r)
+		}
+	}()
+	l := New(10, WithCleanupInterval(-1*time.Second))
+	defer l.Close()
+	l.Allow("k")
+}
+
+// TestWithMaxIdleTime_ZeroSafe 验证 WithMaxIdleTime(0) 不让 Limiter 进入异常状态.
+// 0 会让所有 visitor 在每次 cleanup 时被删除 — 这是用户预期吗?
+// 修复策略:规范化为默认值,避免用户误配.
+func TestWithMaxIdleTime_ZeroSafe(t *testing.T) {
+	l := New(10, WithMaxIdleTime(0), WithCleanupInterval(50*time.Millisecond))
+	defer l.Close()
+
+	l.Allow("k")
+	// 等待 1 个 cleanup 周期 + 余量.
+	time.Sleep(150 * time.Millisecond)
+
+	// 因为 maxIdleTime 被规范化为 5 分钟,visitor 不应被清理.
+	if got := l.Size(); got == 0 {
+		t.Error("WithMaxIdleTime(0) 应被规范化为默认 5 分钟,visitor 不应被清理.")
+	}
+}
+
+// TestWithMaxKeys_NegativeSafe 验证负数 maxKeys 被规范化为 0(无上限),
+// 而不是静默等价于"配了防护但永远不生效".
+func TestWithMaxKeys_NegativeSafe(t *testing.T) {
+	l := New(10, WithMaxKeys(-100))
+	defer l.Close()
+
+	// 负数被规范化为 0(无上限)— 应可以无限创建 key.
+	for i := range 50 {
+		if !l.Allow(fmt.Sprintf("k%d", i)) {
+			t.Errorf("WithMaxKeys(-100) 应等价于无上限,key %d 不应被拒.", i)
+		}
+	}
+}
+
+// TestFractionalRate 验证 rps < 1 时 burst 至少为 1,不再因 int(rps)=0 全拒.
+func TestFractionalRate(t *testing.T) {
+	l := New(0.5)
+	defer l.Close()
+
+	if l.Burst() < 1 {
+		t.Fatalf("burst should be >= 1 for fractional rps, got %d.", l.Burst())
+	}
+	if !l.Allow("k") {
+		t.Error("first request should be allowed (burst >= 1 with fractional rps).")
+	}
+}
+
+// TestAllowN_NonPositive 验证 n <= 0 时 AllowN 直接返回 true.
+func TestAllowN_NonPositive(t *testing.T) {
+	l := New(10, WithBurst(1))
+	defer l.Close()
+
+	if !l.AllowN("k", 0) {
+		t.Error("AllowN(_, 0) should always return true.")
+	}
+	if !l.AllowN("k", -5) {
+		t.Error("AllowN(_, -5) should always return true.")
+	}
+}
+
+// TestWithMaxKeys 验证键基数上限达到后,新 key 被拒.
+func TestWithMaxKeys(t *testing.T) {
+	l := New(1000, WithMaxKeys(2))
+	defer l.Close()
+
+	if !l.Allow("a") {
+		t.Fatal("key a should be allowed (1st new key).")
+	}
+	if !l.Allow("b") {
+		t.Fatal("key b should be allowed (2nd new key).")
+	}
+	if l.Allow("c") {
+		t.Error("key c should be rejected (over WithMaxKeys=2).")
+	}
+	// 已存在的 key 仍可访问.
+	if !l.Allow("a") {
+		t.Error("existing key a should still be allowed after maxKeys reached.")
+	}
+	if got := l.Size(); got != 2 {
+		t.Errorf("Size() should be 2, got %d.", got)
+	}
+}
+
+// TestWithOnReject 验证拒绝回调按 reason 正确触发.
+func TestWithOnReject(t *testing.T) {
+	var rateRejects, maxKeyRejects atomic.Int64
+	l := New(1, WithBurst(1), WithMaxKeys(1), WithOnReject(func(key string, reason RejectReason) {
+		switch reason {
+		case RejectRate:
+			rateRejects.Add(1)
+		case RejectMaxKeys:
+			maxKeyRejects.Add(1)
+		}
+	}))
+	defer l.Close()
+
+	// 第 1 个 key 占满 burst.
+	l.Allow("a")
+	l.Allow("a") // 触发 rate reject(令牌不足).
+	l.Allow("b") // 触发 max_keys reject(已达上限).
+
+	if rateRejects.Load() != 1 {
+		t.Errorf("expected 1 rate reject, got %d.", rateRejects.Load())
+	}
+	if maxKeyRejects.Load() != 1 {
+		t.Errorf("expected 1 max_keys reject, got %d.", maxKeyRejects.Load())
+	}
+}
+
+// TestSize 验证 Size 在 Allow / Reset / cleanup 之后正确更新.
+func TestSize(t *testing.T) {
+	l := New(100, WithCleanupInterval(50*time.Millisecond), WithMaxIdleTime(100*time.Millisecond))
+	defer l.Close()
+
+	l.Allow("a")
+	l.Allow("b")
+	l.Allow("c")
+	if got := l.Size(); got != 3 {
+		t.Errorf("Size() after 3 Allow should be 3, got %d.", got)
+	}
+
+	l.Reset("a")
+	if got := l.Size(); got != 2 {
+		t.Errorf("Size() after Reset should be 2, got %d.", got)
+	}
+
+	// 等待 idle + cleanup 触发.
+	time.Sleep(250 * time.Millisecond)
+	if got := l.Size(); got != 0 {
+		t.Errorf("Size() after cleanup should be 0, got %d.", got)
+	}
+}
+
+// TestCheck_RetryAfterFractional 验证 rate<1 时 Check 返回的 RetryAfter 按 1/rate 计算.
+// 这是给上层中间件写 Retry-After 响应头用的 — 之前在 middleware 层耦合测试,
+// v2 拆 Check 接口后,核心库直接测 Result.RetryAfter,框架无关.
+func TestCheck_RetryAfterFractional(t *testing.T) {
+	l := New(0.1) // rate=0.1/s → RetryAfter 应为 10s.
+	defer l.Close()
+
+	l.Allow("k") // 用尽桶.
+	r := l.Check("k")
+
+	if r.Allowed {
+		t.Fatal("用尽后 Check 应返回 Allowed=false.")
+	}
+	if r.RetryAfter != 10*time.Second {
+		t.Errorf("rate=0.1 时 RetryAfter 应为 10s,实际 %v.", r.RetryAfter)
+	}
+	if r.Reason != RejectRate {
+		t.Errorf("拒绝原因应为 RejectRate,实际 %v.", r.Reason)
+	}
+}
+
+// TestCheck_Allowed 验证 Check 在允许路径返回的字段都被填充.
+func TestCheck_Allowed(t *testing.T) {
+	l := New(100, WithBurst(50))
+	defer l.Close()
+
+	r := l.Check("k")
+	if !r.Allowed {
+		t.Fatal("首次请求应允许.")
+	}
+	if r.Limit != 50 {
+		t.Errorf("Limit 应为 burst=50,实际 %d.", r.Limit)
+	}
+	if r.Remaining < 48 || r.Remaining > 50 {
+		t.Errorf("Remaining 应在 [48,50] 内(刚消耗 1 个),实际 %v.", r.Remaining)
+	}
+	if r.ResetAt.IsZero() {
+		t.Error("允许路径 ResetAt 应被填充.")
+	}
+	if r.RetryAfter != 0 {
+		t.Errorf("允许路径 RetryAfter 应为 0,实际 %v.", r.RetryAfter)
+	}
+	if r.Reason != "" {
+		t.Errorf("允许路径 Reason 应为空,实际 %v.", r.Reason)
+	}
+}
+
+// TestCheck_MaxKeysRejected 验证 Check 在 maxKeys 上限被拒时 Reason=RejectMaxKeys.
+func TestCheck_MaxKeysRejected(t *testing.T) {
+	l := New(10, WithMaxKeys(1))
+	defer l.Close()
+
+	l.Allow("a") // 占满 1 个 key.
+
+	r := l.Check("b")
+	if r.Allowed {
+		t.Fatal("超过 maxKeys 上限应被拒.")
+	}
+	if r.Reason != RejectMaxKeys {
+		t.Errorf("拒绝原因应为 RejectMaxKeys,实际 %v.", r.Reason)
+	}
+	if r.RetryAfter <= 0 {
+		t.Errorf("MaxKeys 拒绝时 RetryAfter 应 > 0,实际 %v.", r.RetryAfter)
+	}
+}
+
+// TestRetryAfterSeconds_Helper 验证 exported helper 的边界行为.
+func TestRetryAfterSeconds_Helper(t *testing.T) {
+	cases := []struct {
+		rate float64
+		want int
+	}{
+		{rate: 100, want: 1},  // rate >= 1 → 1 秒.
+		{rate: 1, want: 1},    // rate = 1 → 1 秒.
+		{rate: 0.5, want: 2},  // rate = 0.5 → 2 秒.
+		{rate: 0.1, want: 10}, // rate = 0.1 → 10 秒.
+		{rate: 0.05, want: 20},
+		{rate: 0, want: 1}, // 异常 → 1 秒兜底.
+		{rate: -1, want: 1},
+	}
+	for _, c := range cases {
+		if got := RetryAfterSeconds(c.rate); got != c.want {
+			t.Errorf("RetryAfterSeconds(%v) = %d,期望 %d.", c.rate, got, c.want)
+		}
+	}
+}
+
+// ================== 并发测试 ==================
 
 func TestConcurrency_Correctness(t *testing.T) {
 	const burst = 50
@@ -178,21 +480,19 @@ func TestConcurrency_Correctness(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for range 200 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 10 {
 				if l.Allow("strict") {
 					allowed.Add(1)
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
 	a := allowed.Load()
 	t.Logf("concurrency: allowed=%d / total=2000 (burst=%d).", a, burst)
-	// Allow small margin for token refill during test.
+	// 留 5 个余量给测试期间的令牌补充.
 	if a > int64(burst)+5 {
 		t.Errorf("CRITICAL: allowed %d > burst %d. Race condition.", a, burst)
 	}
@@ -206,9 +506,7 @@ func TestConcurrency_NoLoss(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for range 100 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 100 {
 				if l.Allow("k") {
 					allowed.Add(1)
@@ -216,7 +514,7 @@ func TestConcurrency_NoLoss(t *testing.T) {
 					rejected.Add(1)
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -237,21 +535,19 @@ func TestConcurrency_MultiKey(t *testing.T) {
 	for i := range 20 {
 		key := fmt.Sprintf("key-%d", i)
 		for range 10 {
-			wg.Add(1)
-			go func(idx int) {
-				defer wg.Done()
+			wg.Go(func() {
 				for range 5 {
 					if l.Allow(key) {
-						results[idx].Add(1)
+						results[i].Add(1)
 					}
 				}
-			}(i)
+			})
 		}
 	}
 	wg.Wait()
 
-	for i, r := range results {
-		if a := r.Load(); a > int64(burst)+3 {
+	for i := range results {
+		if a := results[i].Load(); a > int64(burst)+3 {
 			t.Errorf("key %d: allowed %d > burst %d.", i, a, burst)
 		}
 	}
@@ -265,11 +561,9 @@ func TestConcurrency_LoadOrStore(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for i := range 100 {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			ptrs[idx] = l.getOrCreate("race-key")
-		}(i)
+		wg.Go(func() {
+			ptrs[i] = l.getOrCreate("race-key")
+		})
 	}
 	wg.Wait()
 
@@ -280,28 +574,30 @@ func TestConcurrency_LoadOrStore(t *testing.T) {
 	}
 }
 
-// ================== Cleanup Tests ==================
+// ================== 清理测试 ==================
 
 func TestCleanup(t *testing.T) {
 	l := New(10, WithCleanupInterval(50*time.Millisecond), WithMaxIdleTime(100*time.Millisecond))
 	defer l.Close()
 
 	l.Allow("should-expire")
-	// Wait for idle + cleanup cycle.
+	// 等待 idle + 一次清理循环.
 	time.Sleep(250 * time.Millisecond)
 
-	// The expired key should have been cleaned up.
-	// Create it again — if cleanup worked, Tokens returns full burst.
+	// 过期 key 应已被清理.
+	// 再触发一次查询 — 若清理生效,Tokens 返回满 burst.
 	if tok := l.Tokens("should-expire"); tok != 10 {
 		t.Errorf("expected full burst after cleanup, got %f.", tok)
 	}
 }
 
 func TestCleanup_ActiveKeysSurvive(t *testing.T) {
-	l := New(100, WithCleanupInterval(50*time.Millisecond), WithMaxIdleTime(200*time.Millisecond))
+	// rate=2/s + burst=100 → 在 250ms 内最多补 0.5 个令牌,active 桶仍处于"被消耗"状态,
+	// 避免出现"rate ≥ burst 时令牌瞬间补满"导致断言永远失败的测试设计 bug.
+	l := New(2, WithBurst(100), WithCleanupInterval(50*time.Millisecond), WithMaxIdleTime(200*time.Millisecond))
 	defer l.Close()
 
-	// Keep one key active, let the other expire.
+	// 保持一个 key 活跃,让另一个过期.
 	l.Allow("active")
 	l.Allow("idle")
 
@@ -309,312 +605,19 @@ func TestCleanup_ActiveKeysSurvive(t *testing.T) {
 	l.Allow("active") // Refresh active key.
 	time.Sleep(150 * time.Millisecond)
 
-	// Active key should still have its state (not full burst).
+	// 活跃 key 应保留状态(不是满 burst).
 	activeTok := l.Tokens("active")
 	idleTok := l.Tokens("idle")
 
 	if activeTok >= float64(l.Burst()) {
-		t.Error("active key should have consumed tokens, not be full.")
+		t.Errorf("active key should have consumed tokens, got %f / burst=%d.", activeTok, l.Burst())
 	}
 	if idleTok != float64(l.Burst()) {
 		t.Errorf("idle key should have been cleaned up and return full burst, got %f.", idleTok)
 	}
 }
 
-// ================== Gin Middleware Tests ==================
-
-func newTestRouter(mw gin.HandlerFunc) *gin.Engine {
-	r := gin.New()
-	r.GET("/test", mw, func(c *gin.Context) {
-		c.String(http.StatusOK, "ok")
-	})
-	r.GET("/health", mw, func(c *gin.Context) {
-		c.String(http.StatusOK, "healthy")
-	})
-	return r
-}
-
-func doRequest(r *gin.Engine, path, ip string) *httptest.ResponseRecorder {
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", path, nil)
-	req.RemoteAddr = ip + ":12345"
-	r.ServeHTTP(w, req)
-	return w
-}
-
-func TestMiddleware_Basic(t *testing.T) {
-	l := New(5)
-	defer l.Close()
-	r := newTestRouter(GinMiddleware(l))
-
-	for i := range 5 {
-		w := doRequest(r, "/test", "10.0.0.1")
-		if w.Code != http.StatusOK {
-			t.Errorf("request %d: expected 200, got %d.", i+1, w.Code)
-		}
-	}
-
-	w := doRequest(r, "/test", "10.0.0.1")
-	if w.Code != http.StatusTooManyRequests {
-		t.Errorf("request 6: expected 429, got %d.", w.Code)
-	}
-}
-
-func TestMiddleware_Headers(t *testing.T) {
-	l := New(100)
-	defer l.Close()
-	r := newTestRouter(GinMiddleware(l))
-
-	w := doRequest(r, "/test", "10.0.0.1")
-
-	for _, h := range []string{"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"} {
-		if w.Header().Get(h) == "" {
-			t.Errorf("missing header %s.", h)
-		}
-	}
-}
-
-func TestMiddleware_429Headers(t *testing.T) {
-	l := New(1)
-	defer l.Close()
-	r := newTestRouter(GinMiddleware(l))
-
-	doRequest(r, "/test", "10.0.0.1") // Exhaust.
-	w := doRequest(r, "/test", "10.0.0.1")
-
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected 429, got %d.", w.Code)
-	}
-	if w.Header().Get("Retry-After") == "" {
-		t.Error("429 response should include Retry-After header.")
-	}
-	if w.Header().Get("X-RateLimit-Remaining") != "0" {
-		t.Errorf("429 response should have X-RateLimit-Remaining: 0, got %s.", w.Header().Get("X-RateLimit-Remaining"))
-	}
-}
-
-func TestMiddleware_DifferentIPs(t *testing.T) {
-	l := New(2)
-	defer l.Close()
-	r := newTestRouter(GinMiddleware(l))
-
-	// Exhaust IP1.
-	doRequest(r, "/test", "10.0.0.1")
-	doRequest(r, "/test", "10.0.0.1")
-
-	// IP2 should be independent.
-	w := doRequest(r, "/test", "10.0.0.2")
-	if w.Code != http.StatusOK {
-		t.Errorf("different IP should be allowed, got %d.", w.Code)
-	}
-}
-
-func TestMiddleware_Skip(t *testing.T) {
-	l := New(1)
-	defer l.Close()
-	r := newTestRouter(Middleware(MiddlewareConfig{
-		Limiter: l,
-		Skip:    SkipPaths("/health"),
-	}))
-
-	// /health should always pass, even after exhausting the limiter.
-	for range 10 {
-		w := doRequest(r, "/health", "10.0.0.1")
-		if w.Code != http.StatusOK {
-			t.Errorf("skipped path should always return 200, got %d.", w.Code)
-		}
-	}
-}
-
-func TestMiddleware_SkipIPs(t *testing.T) {
-	l := New(1)
-	defer l.Close()
-	r := newTestRouter(Middleware(MiddlewareConfig{
-		Limiter: l,
-		Skip:    SkipIPs("10.0.0.99"),
-	}))
-
-	for range 10 {
-		w := doRequest(r, "/test", "10.0.0.99")
-		if w.Code != http.StatusOK {
-			t.Errorf("whitelisted IP should always pass, got %d.", w.Code)
-		}
-	}
-}
-
-func TestMiddleware_CombineSkips(t *testing.T) {
-	l := New(1)
-	defer l.Close()
-	r := newTestRouter(Middleware(MiddlewareConfig{
-		Limiter: l,
-		Skip: CombineSkips(
-			SkipPaths("/health"),
-			SkipIPs("10.0.0.99"),
-		),
-	}))
-
-	// Both should be skipped.
-	doRequest(r, "/test", "10.0.0.1") // Exhaust the limiter for non-skipped.
-	doRequest(r, "/test", "10.0.0.1")
-
-	w1 := doRequest(r, "/health", "10.0.0.1")
-	w2 := doRequest(r, "/test", "10.0.0.99")
-	if w1.Code != 200 || w2.Code != 200 {
-		t.Errorf("combined skips should pass: health=%d, whitelistIP=%d.", w1.Code, w2.Code)
-	}
-}
-
-func TestMiddleware_CustomKeyFunc(t *testing.T) {
-	l := New(2)
-	defer l.Close()
-	r := newTestRouter(Middleware(MiddlewareConfig{
-		Limiter: l,
-		KeyFunc: func(c *gin.Context) string {
-			return c.GetHeader("X-User-ID")
-		},
-	}))
-
-	// Same IP, different user headers → different keys.
-	for range 2 {
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", "/test", nil)
-		req.RemoteAddr = "10.0.0.1:1234"
-		req.Header.Set("X-User-ID", "user-A")
-		r.ServeHTTP(w, req)
-	}
-
-	// user-A exhausted, but user-B should still work.
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/test", nil)
-	req.RemoteAddr = "10.0.0.1:1234"
-	req.Header.Set("X-User-ID", "user-B")
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("different user key should be allowed, got %d.", w.Code)
-	}
-}
-
-func TestMiddleware_CustomErrorHandler(t *testing.T) {
-	var called atomic.Bool
-
-	l := New(1)
-	defer l.Close()
-	r := newTestRouter(Middleware(MiddlewareConfig{
-		Limiter: l,
-		ErrorHandler: func(c *gin.Context) {
-			called.Store(true)
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"custom": true})
-		},
-	}))
-
-	doRequest(r, "/test", "10.0.0.1") // Exhaust.
-	doRequest(r, "/test", "10.0.0.1") // Trigger custom handler.
-
-	if !called.Load() {
-		t.Error("custom error handler was not called.")
-	}
-}
-
-func TestIPLimit(t *testing.T) {
-	mw := IPLimit(3)
-	r := newTestRouter(mw)
-
-	for range 3 {
-		w := doRequest(r, "/test", "10.0.0.1")
-		if w.Code != 200 {
-			t.Error("should be allowed within limit.")
-		}
-	}
-	w := doRequest(r, "/test", "10.0.0.1")
-	if w.Code != 429 {
-		t.Errorf("should be rejected, got %d.", w.Code)
-	}
-}
-
-func TestPathIPLimit(t *testing.T) {
-	mw := PathIPLimit(2)
-	r := gin.New()
-	r.GET("/a", mw, func(c *gin.Context) { c.String(200, "a") })
-	r.GET("/b", mw, func(c *gin.Context) { c.String(200, "b") })
-
-	// Exhaust /a.
-	doReq := func(path string) int {
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", path, nil)
-		req.RemoteAddr = "10.0.0.1:1234"
-		r.ServeHTTP(w, req)
-		return w.Code
-	}
-
-	doReq("/a")
-	doReq("/a")
-	if code := doReq("/a"); code != 429 {
-		t.Errorf("/a should be exhausted, got %d.", code)
-	}
-	// /b should be independent.
-	if code := doReq("/b"); code != 200 {
-		t.Errorf("/b should be allowed, got %d.", code)
-	}
-}
-
-func TestUserLimit(t *testing.T) {
-	mw := UserLimit(2, func(c *gin.Context) string {
-		return c.GetHeader("X-User-ID")
-	})
-	r := newTestRouter(mw)
-
-	sendAs := func(uid string) int {
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest("GET", "/test", nil)
-		req.RemoteAddr = "10.0.0.1:1234"
-		if uid != "" {
-			req.Header.Set("X-User-ID", uid)
-		}
-		r.ServeHTTP(w, req)
-		return w.Code
-	}
-
-	sendAs("alice")
-	sendAs("alice")
-	if code := sendAs("alice"); code != 429 {
-		t.Errorf("alice should be exhausted, got %d.", code)
-	}
-	if code := sendAs("bob"); code != 200 {
-		t.Errorf("bob should be allowed, got %d.", code)
-	}
-}
-
-func TestMiddleware_Concurrency(t *testing.T) {
-	l := New(10000, WithBurst(50))
-	defer l.Close()
-	r := newTestRouter(GinMiddleware(l))
-
-	var allowed atomic.Int64
-	var wg sync.WaitGroup
-
-	for range 200 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for range 10 {
-				w := doRequest(r, "/test", "10.0.0.1")
-				if w.Code == 200 {
-					allowed.Add(1)
-				}
-			}
-		}()
-	}
-	wg.Wait()
-
-	a := allowed.Load()
-	t.Logf("middleware concurrency: allowed=%d (burst=50).", a)
-	if a > 55 {
-		t.Errorf("allowed %d > burst 50 + margin. Race condition.", a)
-	}
-}
-
-// ================== Benchmarks ==================
+// ================== Benchmark ==================
 
 func BenchmarkAllow_SingleKey(b *testing.B) {
 	l := New(1000000)
@@ -643,22 +646,6 @@ func BenchmarkAllow_MultiKey(b *testing.B) {
 		for pb.Next() {
 			l.Allow(keys[i%len(keys)])
 			i++
-		}
-	})
-}
-
-func BenchmarkMiddleware(b *testing.B) {
-	l := New(1000000)
-	defer l.Close()
-	r := newTestRouter(GinMiddleware(l))
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			w := httptest.NewRecorder()
-			req, _ := http.NewRequest("GET", "/test", nil)
-			req.RemoteAddr = "10.0.0.1:1234"
-			r.ServeHTTP(w, req)
 		}
 	})
 }

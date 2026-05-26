@@ -1,4 +1,4 @@
 package golimit
 
-// Version is the current version of the json package.
-const Version = "v2.0.0"
+// Version 是当前 golimit v2 包的版本号.
+const Version = "v2.1.0"

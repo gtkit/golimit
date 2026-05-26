@@ -1,5 +1,11 @@
-// Package golimit provides a thin, concurrency-safe rate limiting wrapper
-// around golang.org/x/time/rate with automatic per-key isolation and cleanup.
+// Package golimit 提供轻量、并发安全的限流封装,
+// 基于 golang.org/x/time/rate(令牌桶算法),支持 per-key 隔离与自动清理.
+//
+// Deprecated: v1 已停止新功能开发,仅接受关键 bug 修复.
+// 新项目请使用 github.com/gtkit/golimit/v2 — 修复了 v1 的若干设计缺陷:
+//   - 从全局单例改为可实例化的 *Limiter,支持多个独立限流器.
+//   - 新增 Close() 优雅关闭 cleanup goroutine,不再泄漏.
+//   - 支持 fractional rps、键基数上限 (WithMaxKeys) 防 DoS、拒绝回调 (WithOnReject).
 package golimit
 
 import (
@@ -10,36 +16,45 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Limiters holds a concurrent map of per-key rate limiters.
+// Limiters 是 per-key 限流器的并发安全注册表.
 type Limiters struct {
 	limiters sync.Map // map[string]*Limiter.
 }
 
-// Limiter wraps a rate.Limiter with last-access tracking for automatic cleanup.
+// Limiter 包装 rate.Limiter,额外记录最后访问时间用于自动清理.
 type Limiter struct {
 	limiter *rate.Limiter
-	lastGet atomic.Int64 // Unix nano timestamp, updated atomically to avoid data race.
-	key     string
+	lastGet atomic.Int64 // Unix 纳秒时间戳,原子更新,避免 data race.
 }
 
-// GlobalLimiters is the package-level limiter registry.
-// All keys share this single registry with background cleanup.
+// GlobalLimiters 是包级单例注册表,所有 key 共享同一注册表与同一后台清理 goroutine.
 var GlobalLimiters = &Limiters{}
 
 var once sync.Once
 
-// NewLimiter returns a per-key rate limiter that allows rps requests per second
-// with an initial burst capacity of rps.
+// NewLimiter 返回指定 key 的限流器,允许每秒 rps 个请求,初始突发容量等于 rps.
 //
-// The first call starts a background cleanup goroutine (via sync.Once).
-// Subsequent calls for the same key return the existing limiter — they do NOT
-// create a new one.
+// 首次调用会通过 sync.Once 启动后台清理 goroutine.
 //
-// Usage:
+// 🔄 行为说明(自 v1.0.5):同一 key 多次调用 NewLimiter 时,新传入的 rps **会热更新**
+// 到现有 Limiter(底层调用 stdlib rate.Limiter.SetLimit/SetBurst,并发安全).
+// 此前版本(<= v1.0.4)会静默忽略新 rps,只返回首次创建的实例 — 这是隐性 bug,
+// 现已修复.
+//
+// stdlib 的"放气"语义注意:把 rps 从高调到低(例如 100 → 5)的瞬间,桶里已有的
+// token 不会立即被砍到新 burst,要到下次 Allow 调用时才会 cap.因此切换过渡期
+// 可能放过最多 (旧 burst) 个请求,之后才严格按新 rps 限流.如需立即生效,
+// 请额外等待至少 1 / (旧 rps) 秒,让 stdlib 自然回填.
+//
+// rps < 0 会被规范化为 0(等价于"完全禁止"),避免触发 stdlib SetBurst 的 panic.
+//
+// Deprecated: 请改用 github.com/gtkit/golimit/v2 的 New() + Allow(key).
+//
+// 用法:
 //
 //	lim := golimit.NewLimiter("ip:192.168.1.1:/api/v1", 100)
 //	if !lim.Allow() {
-//	    // rate limited
+//	    // 被限流了.
 //	}
 func NewLimiter(key string, rps int) *Limiter {
 	once.Do(func() {
@@ -48,41 +63,60 @@ func NewLimiter(key string, rps int) *Limiter {
 	return GlobalLimiters.getLimiter(key, rps)
 }
 
-// Allow reports whether the request is allowed under the rate limit.
-// It is safe to call concurrently from multiple goroutines.
+// Allow 判断当前请求是否在限流额度内.
+// 并发安全,可以从任意数量的 goroutine 同时调用.
 func (l *Limiter) Allow() bool {
 	l.lastGet.Store(time.Now().UnixNano())
 	return l.limiter.Allow()
 }
 
-// getLimiter retrieves an existing limiter or atomically creates a new one.
-// Uses LoadOrStore to eliminate the race condition where two goroutines
-// both see a missing key and each create a separate limiter.
+// getLimiter 查找已有 Limiter 或原子地创建新实例.
+//
+// 命中已有 key 时,若 rps 与当前 Limit() 不同则调用 stdlib SetLimit/SetBurst
+// 热更新,保证调速后续生效.LoadOrStore 用于消除多 goroutine 同时首次创建的竞态.
 func (ls *Limiters) getLimiter(key string, rps int) *Limiter {
+	// 负数 rps 会触发 rate.Limiter.SetBurst 内部 panic("burst < 0"),规范化为 0.
+	if rps < 0 {
+		rps = 0
+	}
+
+	newLimit := rate.Limit(rps)
+
 	if v, ok := ls.limiters.Load(key); ok {
-		return v.(*Limiter)
+		l := v.(*Limiter)
+		// Limit() 内部加锁;先比较再 Set 可以省去 rps 不变时的两次额外 Lock.
+		if l.limiter.Limit() != newLimit {
+			l.limiter.SetLimit(newLimit)
+			l.limiter.SetBurst(rps)
+		}
+		return l
 	}
 
 	l := &Limiter{
-		// 实例化一个限流器，桶的容量是1，每秒生成一个令牌
-		// 1.第一个参数是 r Limit。代表每秒可以向 Token 桶中产生多少 token。Limit 实际上是 float64 的别名
-		// 2.第二个参数是 b int。b 代表 初始并发量,看做是桶的容量。
-		limiter: rate.NewLimiter(rate.Limit(rps), rps),
-		// lastGet 不需要初始化 — Allow() 会立即更新.
-		key: key,
+		// 第一个参数 r Limit:每秒向桶中补充的 token 数(rate.Limit 即 float64).
+		// 第二个参数 b int:桶容量,即允许的最大突发并发量.
+		limiter: rate.NewLimiter(newLimit, rps),
 	}
 	l.lastGet.Store(time.Now().UnixNano())
 
 	if actual, loaded := ls.limiters.LoadOrStore(key, l); loaded {
-		return actual.(*Limiter)
+		// 输给了另一个 goroutine 的 LoadOrStore — 拿到的实例可能是别人刚塞进去的,
+		// 其 rps 可能与本次入参不同.同步一次 SetLimit/SetBurst 以保证"最后写入者胜出"
+		// 的语义,行为与命中已有 key 时一致.
+		existing := actual.(*Limiter)
+		if existing.limiter.Limit() != newLimit {
+			existing.limiter.SetLimit(newLimit)
+			existing.limiter.SetBurst(rps)
+		}
+		return existing
 	}
 	return l
 }
 
-// idleThreshold is the maximum idle duration before a limiter is removed by cleanup.
+// idleThreshold 是 Limiter 被回收前允许的最大空闲时长.
 const idleThreshold = 5 * time.Minute
 
-// clearLimiter runs in a background goroutine and periodically removes idle limiters.
+// clearLimiter 在后台 goroutine 中周期性地清理空闲 Limiter.
 func (ls *Limiters) clearLimiter() {
 	for {
 		time.Sleep(1 * time.Minute)
@@ -90,8 +124,8 @@ func (ls *Limiters) clearLimiter() {
 	}
 }
 
-// clearOnce performs a single cleanup pass, removing limiters that have not been
-// accessed within idleThreshold. Extracted for testability.
+// clearOnce 执行一次清理,移除超过 idleThreshold 没被访问的 Limiter.
+// 抽成独立函数便于测试.
 func (ls *Limiters) clearOnce() {
 	now := time.Now().UnixNano()
 	ls.limiters.Range(func(key, value any) bool {
@@ -99,6 +133,6 @@ func (ls *Limiters) clearOnce() {
 		if now-lim.lastGet.Load() > int64(idleThreshold) {
 			ls.limiters.Delete(key)
 		}
-		return true // 始终返回 true，遍历所有 key.
+		return true // 始终返回 true,遍历所有 key.
 	})
 }
