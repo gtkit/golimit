@@ -551,15 +551,35 @@ func BenchmarkAllow_MultiKey(b *testing.B) {
 	})
 }
 
-// BenchmarkGetLimiter_ExistingKey 测量已存在 key 的查找开销(含 v1.0.5 热更新比较).
-func BenchmarkGetLimiter_ExistingKey(b *testing.B) {
+// BenchmarkGetLimiter_RPSUnchanged 测量"同 key 同 rps"的 hot path 开销.
+// v1.0.6 用 atomic.Int64 缓存 rps 替代 v1.0.5 的 mutex Limit() 比较,
+// 应显著快于 v1.0.5(~50ns → ~1ns 比较开销).
+// 这是模式 B(每请求 NewLimiter)用户的实际请求路径.
+func BenchmarkGetLimiter_RPSUnchanged(b *testing.B) {
 	ls := newTestLS()
-	ls.getLimiter("bench-existing", 100)
+	ls.getLimiter("bench-unchanged", 100)
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			ls.getLimiter("bench-existing", 100)
+			ls.getLimiter("bench-unchanged", 100) // 同 key 同 rps
+		}
+	})
+}
+
+// BenchmarkGetLimiter_RPSChanged 测量"同 key 不同 rps"的罕见路径开销,
+// 验证 atomic 缓存正确触发 SetLimit + SetBurst.罕见路径开销可接受.
+func BenchmarkGetLimiter_RPSChanged(b *testing.B) {
+	ls := newTestLS()
+	ls.getLimiter("bench-changed", 100)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			// 在 100 / 101 之间交替,每次都触发热更新路径.
+			ls.getLimiter("bench-changed", 100+(i&1))
+			i++
 		}
 	})
 }

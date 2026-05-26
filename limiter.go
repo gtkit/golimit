@@ -24,6 +24,10 @@ type Limiters struct {
 // Limiter 包装 rate.Limiter,额外记录最后访问时间用于自动清理.
 type Limiter struct {
 	limiter *rate.Limiter
+	// rps 缓存当前配置的速率,用于 getLimiter 命中已有 key 时的快速比较 —
+	// 避免每次都调 rate.Limiter.Limit()(后者加 mutex).
+	// 99% 场景同 key 同 rps,atomic.Load + 整数比较 (~1ns) 即可短路.
+	rps     atomic.Int64
 	lastGet atomic.Int64 // Unix 纳秒时间戳,原子更新,避免 data race.
 }
 
@@ -72,22 +76,25 @@ func (l *Limiter) Allow() bool {
 
 // getLimiter 查找已有 Limiter 或原子地创建新实例.
 //
-// 命中已有 key 时,若 rps 与当前 Limit() 不同则调用 stdlib SetLimit/SetBurst
-// 热更新,保证调速后续生效.LoadOrStore 用于消除多 goroutine 同时首次创建的竞态.
+// 命中已有 key 时,若 rps 与缓存值不同则调用 stdlib SetLimit/SetBurst 热更新.
+// 比较走 atomic.Int64.Load(无锁,~1ns),仅在 rps 真正变化时才付 mutex 代价 —
+// 这是 v1.0.6 相对 v1.0.5 的核心优化,把"99% 场景的 mutex 比较"压缩为原子比较.
+// LoadOrStore 用于消除多 goroutine 同时首次创建的竞态.
 func (ls *Limiters) getLimiter(key string, rps int) *Limiter {
 	// 负数 rps 会触发 rate.Limiter.SetBurst 内部 panic("burst < 0"),规范化为 0.
 	if rps < 0 {
 		rps = 0
 	}
 
-	newLimit := rate.Limit(rps)
-
 	if v, ok := ls.limiters.Load(key); ok {
 		l := v.(*Limiter)
-		// Limit() 内部加锁;先比较再 Set 可以省去 rps 不变时的两次额外 Lock.
-		if l.limiter.Limit() != newLimit {
-			l.limiter.SetLimit(newLimit)
+		// 关键优化:atomic 读 + 整数比较,无 mutex.99% 场景 rps 不变,直接返回.
+		if int(l.rps.Load()) != rps {
+			// rps 真正变化才付 mutex 代价.SetLimit 和 SetBurst 都要,
+			// 因为 v1 API 把 rate 与 burst 绑定到同一 rps 参数.
+			l.limiter.SetLimit(rate.Limit(rps))
 			l.limiter.SetBurst(rps)
+			l.rps.Store(int64(rps))
 		}
 		return l
 	}
@@ -95,18 +102,21 @@ func (ls *Limiters) getLimiter(key string, rps int) *Limiter {
 	l := &Limiter{
 		// 第一个参数 r Limit:每秒向桶中补充的 token 数(rate.Limit 即 float64).
 		// 第二个参数 b int:桶容量,即允许的最大突发并发量.
-		limiter: rate.NewLimiter(newLimit, rps),
+		limiter: rate.NewLimiter(rate.Limit(rps), rps),
 	}
+	// 关键:atomic rps 必须在 LoadOrStore 之前 Store — 否则其他 goroutine 看到
+	// 这个 visitor 时 rps=0,会误以为需要热更新.
+	l.rps.Store(int64(rps))
 	l.lastGet.Store(time.Now().UnixNano())
 
 	if actual, loaded := ls.limiters.LoadOrStore(key, l); loaded {
 		// 输给了另一个 goroutine 的 LoadOrStore — 拿到的实例可能是别人刚塞进去的,
-		// 其 rps 可能与本次入参不同.同步一次 SetLimit/SetBurst 以保证"最后写入者胜出"
-		// 的语义,行为与命中已有 key 时一致.
+		// 其 rps 可能与本次入参不同.同步一次以保证"最后写入者胜出"的语义.
 		existing := actual.(*Limiter)
-		if existing.limiter.Limit() != newLimit {
-			existing.limiter.SetLimit(newLimit)
+		if int(existing.rps.Load()) != rps {
+			existing.limiter.SetLimit(rate.Limit(rps))
 			existing.limiter.SetBurst(rps)
+			existing.rps.Store(int64(rps))
 		}
 		return existing
 	}

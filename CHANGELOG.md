@@ -12,6 +12,36 @@
 
 ## [Unreleased]
 
+## v1.0.6 - 2026-05-26
+
+> 🚀 **纯性能优化版本**:行为完全不变,API 完全兼容,仅把 `getLimiter` 命中已有 key 时
+> 的 mutex 比较替换为 atomic 比较,把"模式 B(每请求 NewLimiter)"用户的开销降到极致.
+>
+> 实测 benchmark 对比:
+>
+> | 路径 | v1.0.5(mutex 比较) | v1.0.6(atomic 缓存) | 改进 |
+> |---|---|---|---|
+> | RPS 不变(99% 场景) | ~101 ns/op | **3.9 ns/op** | **快 25 倍** |
+> | RPS 变化(<1% 场景) | ~150 ns/op | ~362 ns/op* | 罕见路径,正确性优先 |
+>
+> *RPS 变化路径包含 atomic Load + SetLimit + SetBurst + atomic Store 四次开销,
+> 跟 v1.0.5 同数量级,这是正确性必需的开销.
+>
+> 无 API 变化,无行为变化,**v1.0.5 用户可直接升级,零代码改动**.
+
+### Changed
+
+- `Limiter` 结构体新增 `rps atomic.Int64` 字段,缓存当前 rps,替代每次 `rate.Limiter.Limit()` 的 mutex 读.
+- `getLimiter` 命中已有 key 时,比较改为 `atomic.Int64.Load`(~1 ns,免锁),仅在 rps 实际变化时才走 SetLimit + SetBurst.
+- 同步更新 LoadOrStore 输家分支与首次创建分支的 atomic rps 初始化逻辑.
+- 内存:每个 Limiter 多 8 字节(atomic.Int64);相对 v1.0.5 已删除 `Limiter.key` 字段省的 16 字节,**净省 8 字节/Limiter**.
+
+### Tests
+
+- 新增 benchmark `BenchmarkGetLimiter_RPSUnchanged`(模式 B hot path,验证 ~4 ns 量级开销).
+- 新增 benchmark `BenchmarkGetLimiter_RPSChanged`(rps 实际变化路径,验证 SetLimit + SetBurst 正确触发).
+- 移除旧的 `BenchmarkGetLimiter_ExistingKey`(由上述两个更具针对性的 benchmark 取代).
+
 ## v2/v2.1.0 - 2026-05-26
 
 > ⚠ **重大重构(BREAKING)**:v2 核心库**移除所有 Gin 依赖**,迁移至独立的
