@@ -4,13 +4,30 @@
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 仓库内有**三个**独立 Go module:
-- 根目录 `github.com/gtkit/golimit` — v1,维护模式(只接受关键 bug fix)
-- `v2/` 目录 `github.com/gtkit/golimit/v2` — **核心限流库,零第三方依赖**
-- `v2/gin/` 目录 `github.com/gtkit/golimit/v2/gin` — Gin 框架适配层
+- 根目录 `github.com/gtkit/golimit` — v1,全局单例 API,稳定维护
+- `v2/` 目录 `github.com/gtkit/golimit/v2` — v2 实例化 API,零第三方依赖
+- `v2/gin/` 目录 `github.com/gtkit/golimit/v2/gin` — v2 的 Gin 框架适配
 
 ---
 
 ## [Unreleased]
+
+## v1.0.7 - 2026-05-26
+
+> 🎯 **纯文档与内部清理**:行为完全等同 v1.0.6,无 API 变化,无性能变化.
+> 应下游需求撤销 Deprecated 标记 — v1 仍是稳定维护路径,与 v2 是两套独立 API,各有适用场景.
+
+### Changed
+
+- 撤销 Package GoDoc 与 `NewLimiter` 的 `Deprecated:` 标记.staticcheck SA1019 不再对 v1 使用者报警.
+- 内部字段重命名:`Limiters.limiters` → `Limiters.entries`(unexported,无 API 影响),更准确反映"注册表条目"语义.
+- README / CHANGELOG / GoDoc 措辞软化:v1 不再描述为"维护模式 / 仅修关键 bug",改为"全局单例 API,稳定维护".v1 与 v2 的关系改述为"两套独立 API,各有适用场景".
+- 清理源码注释中的历史版本号引用(v1.0.4 / v1.0.5 / v1.0.6 等)— 这些信息属于 git log + CHANGELOG,不应在注释中累积.
+
+### Unchanged
+
+- 公开 API、性能、行为 — 均与 v1.0.6 完全等价
+- 测试 100% 覆盖、benchmark `BenchmarkGetLimiter_RPSUnchanged` 约 4.5 ns/op、race 稳定
 
 ## v1.0.6 - 2026-05-26
 

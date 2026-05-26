@@ -127,10 +127,9 @@ func TestDefaultValues(t *testing.T) {
 	}
 }
 
-// ================== RPS 热更新测试(v1.0.5 行为修复)==================
+// ================== RPS 热更新测试 ==================
 
-// TestRPSHotUpdate 验证同 key 多次调用时,新 rps 热更新到现有 Limiter.
-// 此前(<= v1.0.4)新 rps 会被静默忽略,这是 v1.0.5 的关键行为修复.
+// TestRPSHotUpdate 验证同 key 多次调用 getLimiter 时,新 rps 热更新到现有实例.
 func TestRPSHotUpdate(t *testing.T) {
 	ls := newTestLS()
 
@@ -305,7 +304,7 @@ func TestRPSHotUpdate_LoadOrStoreLoser(t *testing.T) {
 	wg.Wait()
 
 	// 所有 goroutine 拿到的实例应是同一个;最终 Limit 应在合法范围 [1, goroutines] 内.
-	finalLim, _ := ls.limiters.Load(key)
+	finalLim, _ := ls.entries.Load(key)
 	if finalLim == nil {
 		t.Fatal("最终应存在 limiter 实例.")
 	}
@@ -320,7 +319,7 @@ func TestRPSHotUpdate_LoadOrStoreLoser(t *testing.T) {
 
 // TestNewLimiterEntry_BasicAndHotUpdate 端到端验证:
 //   - 包级 NewLimiter 能正常创建 Limiter
-//   - 同 key 二次调用热更新 rps 生效(v1.0.5 行为修复)
+//   - 同 key 二次调用热更新 rps 生效
 //
 // 使用 t.Name() 嵌入 key 避免与其他端到端测试在全局 GlobalLimiters 上冲突.
 func TestNewLimiterEntry_BasicAndHotUpdate(t *testing.T) {
@@ -505,12 +504,12 @@ func TestCleanupRemovesIdleEntries(t *testing.T) {
 	ls.clearOnce()
 
 	// 旧 key 应被清掉.
-	if _, ok := ls.limiters.Load("stale-key"); ok {
+	if _, ok := ls.entries.Load("stale-key"); ok {
 		t.Error("stale-key 应被清理.")
 	}
 
 	// 新 key 应保留.
-	if _, ok := ls.limiters.Load("fresh-key"); !ok {
+	if _, ok := ls.entries.Load("fresh-key"); !ok {
 		t.Error("fresh-key 应仍存在.")
 	}
 }
@@ -552,9 +551,8 @@ func BenchmarkAllow_MultiKey(b *testing.B) {
 }
 
 // BenchmarkGetLimiter_RPSUnchanged 测量"同 key 同 rps"的 hot path 开销.
-// v1.0.6 用 atomic.Int64 缓存 rps 替代 v1.0.5 的 mutex Limit() 比较,
-// 应显著快于 v1.0.5(~50ns → ~1ns 比较开销).
 // 这是模式 B(每请求 NewLimiter)用户的实际请求路径.
+// 实现用 atomic.Int64 缓存 rps,避免 stdlib mutex 锁开销.
 func BenchmarkGetLimiter_RPSUnchanged(b *testing.B) {
 	ls := newTestLS()
 	ls.getLimiter("bench-unchanged", 100)

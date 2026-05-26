@@ -4,13 +4,13 @@
 
 仓库内有 **3 个独立 Go module**,按需引入:
 
-| Module | 用途 | 直接依赖 | 推荐 |
+| Module | API 风格 | 直接依赖 | 适用场景 |
 |---|---|---|---|
-| `github.com/gtkit/golimit` | v1,维护模式(仅修关键 bug) | `golang.org/x/time` | ❌ 新项目勿用 |
-| `github.com/gtkit/golimit/v2` | **v2 核心**:零第三方,实例化,Check + Result | `golang.org/x/time` | ✅ 推荐 |
-| `github.com/gtkit/golimit/v2/gin` | v2 的 Gin 框架适配 | core + `gin-gonic/gin` | ✅ Gin 用户 |
+| `github.com/gtkit/golimit` | v1:全局单例 `NewLimiter(key, rps)` | `golang.org/x/time` | 一个进程一个全局注册表的简单场景 |
+| `github.com/gtkit/golimit/v2` | v2:实例化 `New(rps)` + `Allow(key)` / `Check(key)` | `golang.org/x/time` | 需要多实例 / 生命周期管理 / DoS 防护 |
+| `github.com/gtkit/golimit/v2/gin` | v2 的 Gin 框架适配 | core + `gin-gonic/gin` | Gin 中间件 |
 
-**不用 Gin 的用户只引 v2 核心,go.sum 仅 2 行,0 transitive vulnerability**.
+**v1 与 v2 是两套独立 API,按场景选择**。不用 Gin 的用户只引 v2 核心,go.sum 仅 2 行、0 transitive vulnerability。
 
 详细文档:
 - [`v2/README.md`](./v2/README.md) — 核心 API、Check/Result 用法、生产部署
@@ -103,9 +103,7 @@ cd v2 && make tag
 
 ---
 
-## v1 用户文档(维护模式 - 不再扩展功能)
-
-> ⚠ v1 已停止新功能,仅接受关键 bug 修复.新项目请用 [v2](./v2/).
+## v1 用户文档
 
 ### 安装
 
@@ -124,17 +122,23 @@ if !lim.Allow() {
 }
 ```
 
-- 同 key 多次 `NewLimiter` 时,**自 v1.0.5 起新 rps 会热更新**(之前会被静默忽略).
-- 首次调用启动后台清理 goroutine,**无法关闭**(进程级常驻).
+- 同 key 多次 `NewLimiter` 时,新 rps 会**热更新**到现有 Limiter(stdlib SetLimit/SetBurst,并发安全).
+- 首次调用启动后台清理 goroutine,生命周期与进程相同(不可关闭).
 
-### v1 限制(v2 已解决)
+### v1 与 v2 的设计取舍
 
-- 全局单例 `GlobalLimiters`,无法多实例隔离
-- cleanup goroutine 无 Close() 接口,进程内永驻
-- `rps int` 不支持小数(v2 用 `float64`)
-- 无 KeyFunc / Skip / 自定义 Headers
-- 无键基数上限(v2 提供 `WithMaxKeys` 防 DoS)
-- 无拒绝回调(v2 提供 `WithOnReject` 接入 metrics)
+v1 走"全局单例 + 零配置"路线,简单直接:
+- 全局 `GlobalLimiters` 共享所有 key
+- cleanup goroutine 与进程生命周期一致
+- `rps int` 参数同时控制 rate 与 burst
+
+v2 在 v1 之外,**额外提供**这些能力(适合复杂场景,与 v1 共存):
+- 实例化 `*Limiter`,多个独立注册表
+- `Close()` 优雅关闭 cleanup goroutine
+- `float64` rps,支持 fractional rate
+- `Check(key) Result` 框架无关接口契约
+- `WithMaxKeys` 防键基数 DoS、`WithOnReject` metrics 接入
+- Gin 中间件(在 `v2/gin/` sub-module)
 
 ## License
 
