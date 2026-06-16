@@ -1,6 +1,8 @@
 package golimit
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -466,6 +468,93 @@ func TestRetryAfterSeconds_Helper(t *testing.T) {
 		if got := RetryAfterSeconds(c.rate); got != c.want {
 			t.Errorf("RetryAfterSeconds(%v) = %d,期望 %d.", c.rate, got, c.want)
 		}
+	}
+}
+
+// ================== Wait(阻塞式整流)测试 ==================
+
+// TestWait_Basic 验证有令牌时 Wait 立即返回 nil.
+func TestWait_Basic(t *testing.T) {
+	l := New(100)
+	defer l.Close()
+
+	if err := l.Wait(t.Context(), "k"); err != nil {
+		t.Errorf("有令牌时 Wait 应返回 nil,实际 %v.", err)
+	}
+}
+
+// TestWait_BlocksUntilToken 验证桶用尽后 Wait 阻塞等待令牌补充,而非立即拒绝.
+func TestWait_BlocksUntilToken(t *testing.T) {
+	// 10 rps, burst=1 → 用尽后约 100ms 补 1 个令牌.
+	l := New(10, WithBurst(1))
+	defer l.Close()
+
+	if err := l.Wait(t.Context(), "k"); err != nil {
+		t.Fatalf("首个请求应立即通过,实际 %v.", err)
+	}
+
+	start := time.Now()
+	if err := l.Wait(t.Context(), "k"); err != nil {
+		t.Fatalf("第二个请求应在等待后通过,实际 %v.", err)
+	}
+	waited := time.Since(start)
+
+	// 第二个请求被迫等待约 100ms(留余量,至少 50ms);若几乎没等,说明没整流.
+	if waited < 50*time.Millisecond {
+		t.Errorf("Wait 应阻塞约 100ms 等待令牌,实际只等了 %v.", waited)
+	}
+	t.Logf("Wait 阻塞了 %v 等待令牌补充.", waited)
+}
+
+// TestWait_DeadlineTooShort 验证 ctx deadline 早于令牌补充时间时,Wait 不傻等到
+// deadline,而是(由底层 rate 包)提前返回非 nil 错误.
+func TestWait_DeadlineTooShort(t *testing.T) {
+	// 1 rps, burst=1 → 用尽后需等 1s,但 ctx 只有 50ms,根本来不及补令牌.
+	l := New(1, WithBurst(1))
+	defer l.Close()
+
+	_ = l.Wait(t.Context(), "k") // 用尽桶.
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	if err := l.Wait(ctx, "k"); err == nil {
+		t.Error("deadline 内补不到令牌时 Wait 应返回非 nil 错误.")
+	}
+}
+
+// TestWait_Canceled 验证等待过程中 ctx 被取消时,Wait 返回 context.Canceled.
+func TestWait_Canceled(t *testing.T) {
+	// 1 rps, burst=1 → 用尽后需等 1s;ctx 无 deadline,等待中手动 cancel.
+	l := New(1, WithBurst(1))
+	defer l.Close()
+
+	_ = l.Wait(t.Context(), "k") // 用尽桶.
+
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	err := l.Wait(ctx, "k")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("等待中被 cancel 时 Wait 应返回 context.Canceled,实际 %v.", err)
+	}
+}
+
+// TestWait_MaxKeys 验证 WithMaxKeys 上限后,Wait 新 key 立即返回 ErrMaxKeys.
+func TestWait_MaxKeys(t *testing.T) {
+	l := New(1000, WithMaxKeys(1))
+	defer l.Close()
+
+	if err := l.Wait(t.Context(), "a"); err != nil {
+		t.Fatalf("首个 key 应允许,实际 %v.", err)
+	}
+
+	err := l.Wait(t.Context(), "b")
+	if !errors.Is(err, ErrMaxKeys) {
+		t.Errorf("超过 WithMaxKeys 上限时 Wait 应返回 ErrMaxKeys,实际 %v.", err)
 	}
 }
 

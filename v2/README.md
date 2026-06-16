@@ -2,16 +2,12 @@
 
 生产级 Go 限流库,基于 `golang.org/x/time/rate`(令牌桶算法).
 
-**设计原则:零第三方框架依赖**。核心库只依赖 stdlib + `golang.org/x/time`,
-Web 框架集成通过独立 sub-module 提供:
+**设计原则:零第三方框架依赖**。本包只依赖 stdlib + `golang.org/x/time`,**不绑定任何
+Web 框架**。框架集成(Gin / echo / chi 等)以**文档示例**形式提供——基于框架无关的
+`Check` + `Result` 契约写十几行中间件即可,复制即用,不给你的 `go.sum` 引入任何额外依赖。
 
-| Module | 用途 | 依赖 |
-|---|---|---|
-| `github.com/gtkit/golimit/v2` | **核心限流引擎**(本包) | 仅 `golang.org/x/time`,0 第三方 |
-| `github.com/gtkit/golimit/v2/gin` | Gin 框架适配 | `golimit/v2` + `gin-gonic/gin` |
-
-不需要 Gin 的用户(直接限流、其他框架、RPC、job)**只引入 v2 核心**,
-不会被拖入 gin 的 27 个 indirect 依赖。
+Gin 的完整可复制示例(中间件 / per-IP·user key / Skip 白名单 / 429 + 限流头)见
+**[`docs/gin.md`](../docs/gin.md)**。
 
 ## 安装
 
@@ -52,19 +48,47 @@ if !r.Allowed {
 
 `Result` 是**框架无关**的接口契约,Gin / echo / chi / 自家 RPC / job 调度等都能直接用。
 
-## Gin 适配
+## 阻塞式整流:Wait
+
+`Allow` / `Check` 是"超额即拒"(服务端防刷);`Wait` 是"超额排队等待"(平滑出口流量),
+适合主动调用下游 API / DB / MQ 时把请求速率匀速摊开:
 
 ```go
-import (
-    "github.com/gtkit/golimit/v2"
-    golimitgin "github.com/gtkit/golimit/v2/gin"
-)
+lim := golimit.New(100) // 每秒最多 100 次
+defer lim.Close()
 
-r := gin.New()
-r.Use(golimitgin.IPLimit(100))
+for _, job := range jobs {
+    if err := lim.Wait(ctx, "downstream-api"); err != nil {
+        break // ctx 取消/超时,或 ErrMaxKeys
+    }
+    callDownstream(job) // 被平滑到 ~100 QPS
+}
 ```
 
-完整 Gin 用法见 [`v2/gin/README.md`](./gin/README.md)。
+注意:`Wait` 的取消遵循底层 `rate` 包 —— ctx deadline 早于令牌补充时间时会**提前**
+返回错误(不傻等),等待中被 cancel 返回 `context.Canceled`。
+
+## 接入 Gin / 其他 Web 框架
+
+本包**不绑定框架**,接入只是基于 `Check` 写十几行中间件胶水。最小骨架:
+
+```go
+lim := golimit.New(100)
+defer lim.Close()
+
+r := gin.New()
+r.Use(func(c *gin.Context) {
+    res := lim.Check("ip:" + c.ClientIP())
+    if !res.Allowed {
+        c.AbortWithStatusJSON(429, gin.H{"message": "rate limit exceeded"})
+        return
+    }
+    c.Next()
+})
+```
+
+完整可复制示例(per-IP·user key、Skip 白名单、429 + `X-RateLimit-*` 头)见
+**[`docs/gin.md`](../docs/gin.md)**。
 
 ## 核心 API
 
@@ -74,6 +98,7 @@ r.Use(golimitgin.IPLimit(100))
 | `(*Limiter).Allow(key string) bool` | 检查 1 个请求是否允许(零开销快路径) |
 | `(*Limiter).AllowN(key string, n int) bool` | 检查 n 个请求(`n<=0` 恒 true) |
 | `(*Limiter).Check(key string) Result` | **信息丰富**版本,返回 Result(供中间件写头) |
+| `(*Limiter).Wait(ctx, key string) error` | **阻塞式整流**:超额排队等待而非拒绝,支持 ctx 取消 |
 | `(*Limiter).Tokens(key string) float64` | 当前可用令牌数 |
 | `(*Limiter).Reset(key string)` | 重置指定 key 的限流状态 |
 | `(*Limiter).Size() int64` | 当前缓存的 key 数(运维监控) |
@@ -133,22 +158,12 @@ lim := golimit.New(100, golimit.WithOnReject(func(key string, reason golimit.Rej
 
 `lim.Size()` 返回当前缓存 key 数,适合定期采样到 metrics。
 
-## 从 v2.0.x 迁移到 v2.1.0
+## 旧 v2/gin 用户
 
-```go
-// 旧 v2.0.x:
-import golimit "github.com/gtkit/golimit/v2"
-r.Use(golimit.IPLimit(100))
-
-// 新 v2.1.0+:
-import (
-    "github.com/gtkit/golimit/v2"
-    golimitgin "github.com/gtkit/golimit/v2/gin"
-)
-r.Use(golimitgin.IPLimit(100))
-```
-
-迁移收益:不用 Gin 的代码路径完全摆脱 gin transitive 依赖。
+早期提供过 `github.com/gtkit/golimit/v2/gin` 适配包,现已**移除**——框架适配改为文档
+示例(见 [`docs/gin.md`](../docs/gin.md)),让核心库回归纯粹的通用限流引擎。已发布的
+`v2/gin@v2.0.0` 在 module proxy 中仍可拉取,但不再维护;建议照 `docs/gin.md` 自行接入
+(十几行,基于 `Check`),顺带摆脱 gin 那串间接依赖。
 
 ## 运行测试
 

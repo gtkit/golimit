@@ -2,13 +2,15 @@
 // 基于 golang.org/x/time/rate(令牌桶算法).
 //
 // 设计原则:**零第三方框架依赖**.本包仅依赖 stdlib + golang.org/x/time.
-// Web 框架集成(Gin / echo / chi 等)通过独立的 sub-module 提供,例如
-// github.com/gtkit/golimit/v2/gin.
+// Web 框架集成(Gin / echo / chi 等)以文档示例形式提供(见仓库 docs/gin.md),
+// 基于框架无关的 Check + Result 契约,用户复制即用,不引入任何框架依赖.
 //
 // v2 重设计:Limiter 改为实例化对象(不再是全局单例),通过 Close() 优雅关闭.
 package golimit
 
 import (
+	"context"
+	"errors"
 	"math"
 	"strconv"
 	"sync"
@@ -29,6 +31,10 @@ const (
 	// RejectMaxKeys 因键基数达到 WithMaxKeys 上限而拒绝新建.
 	RejectMaxKeys RejectReason = "max_keys"
 )
+
+// ErrMaxKeys 是 Wait 在 key 基数达到 WithMaxKeys 上限、无法为新 key 创建限流器时
+// 返回的错误.可用 errors.Is(err, ErrMaxKeys) 判定,以区分"键基数被拒"与 ctx 取消.
+var ErrMaxKeys = errors.New("golimit: max keys limit reached")
 
 // RejectFunc 在限流拒绝时被调用,用于接入 metrics / log.
 // 实现必须非阻塞且并发安全 — 它会在请求关键路径上同步执行.
@@ -87,58 +93,6 @@ type Limiter struct {
 type visitor struct {
 	lim      *rate.Limiter
 	lastSeen atomic.Int64 // Unix 纳秒,原子更新,免锁.
-}
-
-// Option 用于配置 Limiter.
-type Option func(*Limiter)
-
-// ================== Options ==================
-
-// WithBurst 设置最大突发容量.
-// 默认为 max(1, ceil(rate)).
-func WithBurst(burst int) Option {
-	return func(l *Limiter) {
-		l.burst = burst
-	}
-}
-
-// WithCleanupInterval 设置后台清理 goroutine 的扫描间隔.
-// 默认为 1 分钟.
-func WithCleanupInterval(d time.Duration) Option {
-	return func(l *Limiter) {
-		l.cleanupInterval = d
-	}
-}
-
-// WithMaxIdleTime 设置 key 空闲多久后被清理.
-// 默认为 5 分钟.
-func WithMaxIdleTime(d time.Duration) Option {
-	return func(l *Limiter) {
-		l.maxIdleTime = d
-	}
-}
-
-// WithMaxKeys 限制 Limiter 内最多保存的 key 数量,达到上限后拒绝新建.
-// 用于防止键基数爆炸攻击(攻击者伪造大量 IP / 路径耗光内存).
-// 默认 0 = 无上限.
-//
-// 推荐线上配置:预估正常业务峰值的 5~10 倍.例如日活 10w 用户可配 100w.
-func WithMaxKeys(n int) Option {
-	return func(l *Limiter) {
-		l.maxKeys = n
-	}
-}
-
-// WithOnReject 注册拒绝回调,在 Allow / AllowN / Check 返回 false 时触发.
-// 用于接入 metrics 计数或结构化日志.回调必须非阻塞.
-//
-// reason 区分两种拒绝:
-//   - RejectRate     — 正常的限流拒绝(令牌不足).
-//   - RejectMaxKeys  — 键基数达到 WithMaxKeys 上限.
-func WithOnReject(fn RejectFunc) Option {
-	return func(l *Limiter) {
-		l.onReject = fn
-	}
 }
 
 // ================== 构造 ==================
@@ -291,6 +245,32 @@ func (l *Limiter) Check(key string) Result {
 		Remaining: v.lim.Tokens(),
 		ResetAt:   now.Add(time.Second),
 	}
+}
+
+// Wait 阻塞直到 key 的限流器放行 1 个请求,或 ctx 被取消 / 超时.
+//
+// 这是 Allow 的"整流"对应物:Allow 超额立即拒绝(返回 false),Wait 超额则排队等待——
+// 适合主动调用下游(API / DB / MQ / 第三方接口)时把发送速率平滑摊开,而非直接丢弃请求.
+// ctx 取消 / 超时可随时中断等待.
+//
+// 返回值:
+//   - nil:已获得令牌,可继续.
+//   - ErrMaxKeys:设置了 WithMaxKeys 且已达上限,新 key 被拒(不阻塞,立即返回).
+//   - 其他非 nil:未获得令牌 —— ctx 在等待中被取消/超时(context.Canceled /
+//     context.DeadlineExceeded),或所需等待时间已超出 ctx deadline 时底层 rate 包
+//     提前返回的错误(不会傻等到 deadline).可用 errors.Is 判定具体类型.
+//
+// Wait 在阻塞期间持有 per-key 限流器的引用,即使该 key 在等待中被 cleanup 回收也不
+// 影响本次等待.因 Wait 是"等待而非拒绝"语义,令牌不足不触发 WithOnReject 回调;
+// 仅 ErrMaxKeys 这种硬拒绝会触发(reason=RejectMaxKeys).
+func (l *Limiter) Wait(ctx context.Context, key string) error {
+	v := l.getOrCreate(key)
+	if v == nil {
+		l.notify(key, RejectMaxKeys)
+		return ErrMaxKeys
+	}
+	v.lastSeen.Store(time.Now().UnixNano())
+	return v.lim.Wait(ctx)
 }
 
 // Tokens 返回指定 key 当前的近似可用令牌数.

@@ -17,8 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 仓库内三个独立 module,各自跑测试.
-        module: ['.', 'v2', 'v2/gin']
+        # 仓库内两个独立 module,各自跑测试.
+        module: ['.', 'v2']
         # golimit 自身仅依赖 stdlib + x/time,Go 版本兼容性放宽.
         # 但 go.mod 声明的是 go 1.26,所以最低版本即 1.26.
         go: ['1.26.x']
@@ -56,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: ['.', 'v2', 'v2/gin']
+        module: ['.', 'v2']
     defaults:
       run:
         working-directory: ${{ matrix.module }}
@@ -80,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: ['.', 'v2', 'v2/gin']
+        module: ['.', 'v2']
     steps:
       - uses: actions/checkout@v4
 

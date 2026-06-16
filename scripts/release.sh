@@ -4,13 +4,11 @@
 # 工作流程:
 #   1. 工作区必须 clean(git status --porcelain 为空)
 #   2. 跑 audit 判定哪些 module 需要发版
-#   3. 按依赖顺序发版:.(v1) → v2(core) → v2/gin
+#   3. 按依赖顺序发版:.(v1) → v2(core)
 #   4. 对每个待发模块:
 #      - cd 进去跑 `make tag`,内部已包含 release-check 全套质量门
 #      - tag 模板会自动 bump version.go(patch) + commit + tag + push
-#   5. 发版 v2 后,如果 v2/gin 也需要发版,自动同步 v2/gin/go.mod 的
-#      `require github.com/gtkit/golimit/v2 vX.Y.Z` 指向最新 v2 tag.
-#   6. 任何一步失败立即 abort,不留半发版状态.
+#   5. 任何一步失败立即 abort,不留半发版状态.
 #
 # 限制(简化设计):
 #   - 只支持 patch bump(vX.Y.Z → vX.Y.Z+1).
@@ -20,9 +18,6 @@
 # 用法:
 #   bash scripts/release.sh         # 自动判定 + 发版
 #   bash scripts/release.sh --dry   # 只打印计划,不实际执行
-#
-# 环境变量:
-#   SKIP_GIN_SYNC=1 — 跳过 v2 → v2/gin go.mod 自动同步(罕用)
 
 set -euo pipefail
 
@@ -79,9 +74,9 @@ if [[ ${#TO_RELEASE[@]} -eq 0 ]]; then
 fi
 
 # ================== Step 3: 按依赖顺序排列待发模块 ==================
-# 依赖链:v1(根) 独立; v2 是 v2/gin 的依赖,所以 v2 在 v2/gin 之前.
+# 依赖链:v1(根) 与 v2 互相独立.
 declare -a ORDERED=()
-for m in . v2 v2/gin; do
+for m in . v2; do
     for r in "${TO_RELEASE[@]}"; do
         if [[ "$r" == "$m" ]]; then
             ORDERED+=("$m")
@@ -103,27 +98,10 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 # ================== Step 4: 逐个发版 ==================
-v2_just_released=0
-
 for m in "${ORDERED[@]}"; do
     echo ""
     echo "🚀 开始发版: $m"
     echo "========================================"
-
-    # 发版 v2/gin 前:如果 v2 刚发了新 tag,同步 v2/gin/go.mod 的 require.
-    if [[ "$m" == "v2/gin" && $v2_just_released -eq 1 && "${SKIP_GIN_SYNC:-0}" != "1" ]]; then
-        latest_v2=$(git tag --list 'v2/v2.*.*' --sort=-version:refname | head -n1 | sed 's|^v2/||')
-        if [[ -n "$latest_v2" ]]; then
-            echo "🔄 同步 v2/gin/go.mod require 到 $latest_v2"
-            sed -i.bak -E "s|(github.com/gtkit/golimit/v2 )v[0-9]+\.[0-9]+\.[0-9]+|\1$latest_v2|" v2/gin/go.mod
-            rm -f v2/gin/go.mod.bak
-            if ! git diff --quiet v2/gin/go.mod; then
-                git add v2/gin/go.mod
-                git commit -m "chore(v2/gin): bump core require to $latest_v2"
-                git push gtkit HEAD
-            fi
-        fi
-    fi
 
     if ! (cd "$m" && make tag); then
         echo ""
@@ -132,10 +110,6 @@ for m in "${ORDERED[@]}"; do
             echo "    待发但未发: $(echo "${ORDERED[@]:$(($(echo "${ORDERED[@]}" | tr ' ' '\n' | grep -n "^$m$" | cut -d: -f1) - 1))}")"
         fi
         exit 1
-    fi
-
-    if [[ "$m" == "v2" ]]; then
-        v2_just_released=1
     fi
 
     echo ""

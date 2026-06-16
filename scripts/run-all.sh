@@ -5,12 +5,12 @@
 #   bash scripts/run-all.sh <make-target>
 #
 # 例如:
-#   bash scripts/run-all.sh test           # 三模块都跑 race 测试
-#   bash scripts/run-all.sh lint           # 三模块都跑 lint
-#   bash scripts/run-all.sh release-check  # 三模块都跑 release-check 全套
+#   bash scripts/run-all.sh test           # 各模块都跑 race 测试
+#   bash scripts/run-all.sh lint           # 各模块都跑 lint
+#   bash scripts/run-all.sh release-check  # 各模块都跑 release-check 全套
 #
 # 行为:
-#   - 遍历 . / v2 / v2/gin,逐个 cd 进去跑 make <target>
+#   - 遍历 . / v2,逐个 cd 进去跑 make <target>
 #   - 任一失败立即 exit 1
 #   - 全部通过则 exit 0
 #
@@ -34,7 +34,7 @@ if [[ -z "$TARGET" ]]; then
     exit 2
 fi
 
-MODULES=(. v2 v2/gin)
+MODULES=(. v2)
 PASSED=()
 
 for m in "${MODULES[@]}"; do

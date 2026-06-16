@@ -2,20 +2,57 @@
 
 轻量级、并发安全的 Go 限流库,基于 `golang.org/x/time/rate`(令牌桶算法).
 
-仓库内有 **3 个独立 Go module**,按需引入:
+仓库内有 **2 个独立 Go module**,按需引入:
 
 | Module | API 风格 | 直接依赖 | 适用场景 |
 |---|---|---|---|
 | `github.com/gtkit/golimit` | v1:全局单例 `NewLimiter(key, rps)` | `golang.org/x/time` | 一个进程一个全局注册表的简单场景 |
-| `github.com/gtkit/golimit/v2` | v2:实例化 `New(rps)` + `Allow(key)` / `Check(key)` | `golang.org/x/time` | 需要多实例 / 生命周期管理 / DoS 防护 |
-| `github.com/gtkit/golimit/v2/gin` | v2 的 Gin 框架适配 | core + `gin-gonic/gin` | Gin 中间件 |
+| [`github.com/gtkit/golimit/v2`](./v2/README.md) | v2:实例化 `New(rps)` + `Allow(key)` / `Check(key)` / `Wait(ctx, key)` | `golang.org/x/time` | 需要多实例 / 生命周期管理 / DoS 防护 |
 
-**v1 与 v2 是两套独立 API,按场景选择**。不用 Gin 的用户只引 v2 核心,go.sum 仅 2 行、0 transitive vulnerability。
+**v1 与 v2 是两套独立 API,按场景选择**。两者都**零第三方框架依赖**,go.sum 仅 2 行。
+
+> 👉 **Gin 用户**:本库不绑定框架,基于 `Check` / `Result` 写十几行中间件即可。完整可复制示例见 **[`docs/gin.md`](./docs/gin.md)**。
 
 详细文档:
-- [`v2/README.md`](./v2/README.md) — 核心 API、Check/Result 用法、生产部署
-- [`v2/gin/README.md`](./v2/gin/README.md) — Gin 中间件 / Skip / KeyFunc 用法
+- [`v2/README.md`](./v2/README.md) — 核心 API、Check/Result/Wait 用法、生产部署
+- [`docs/gin.md`](./docs/gin.md) — 用 golimit 给 Gin 限流(复制即用,含 Skip)
 - [`CHANGELOG.md`](./CHANGELOG.md) — 版本变更历史
+
+---
+
+## 选型:golimit 还是 uber-go/ratelimit?
+
+[uber-go/ratelimit](https://github.com/uber-go/ratelimit) 是另一个常见的 Go 限流库.两者都叫"限流",但解决的是**相反方向**的问题,不是竞品 —— 选错方向会用得很别扭:
+
+- **golimit** = 令牌桶 + **拒绝式**.保护**你自己这个服务端**不被打爆:超额**立即拒绝**(返回 429),不阻塞调用方.
+- **uber-go/ratelimit** = 漏桶 + **阻塞式**.保护**你要调用的下游**:超额**阻塞等待**,把请求匀速摊开发出去.
+
+一句话:**入口防刷用 golimit,出口整流用 uber-go/ratelimit.**
+
+### 按场景选
+
+| 你的需求 | 选谁 |
+|---|---|
+| HTTP / RPC 服务端入口防刷、过载保护 | **golimit** |
+| 按 IP / 用户 / 路径分别限流(per-key) | **golimit**(uber 不支持) |
+| 超额要返回 429 + `Retry-After` / `X-RateLimit-*` 头 | **golimit**(见 [`docs/gin.md`](./docs/gin.md)) |
+| 防伪造海量 key 耗内存的 DoS(`WithMaxKeys`) | **golimit**(uber 不支持) |
+| 主动调用下游 API / DB / MQ,要把发送速率平滑匀速 | **uber-go/ratelimit** |
+| 超额时希望**阻塞排队**而不是被拒绝 | **uber-go/ratelimit** |
+| 单一全局速率、强制匀速抑制突发 | **uber-go/ratelimit** |
+
+### 关键差异速查
+
+| | golimit | uber-go/ratelimit |
+|---|---|---|
+| 算法 | 令牌桶(`x/time/rate`) | 漏桶(自研,零依赖) |
+| 行为 | 非阻塞,超额即拒 | 阻塞,超额即等 |
+| 核心 API | `Allow() bool` / `Check() Result` | `Take() time.Time` |
+| per-key 隔离 | ✅ | ❌(单一速率) |
+| 突发 | 允许(burst 容量) | 抑制(强制匀速) |
+| 典型位置 | 服务端入口 | 客户端出口 |
+
+> 提示:golimit 目前只提供**非阻塞**的 `Allow` / `Check`.若你需要"阻塞等待"式整流,请用 uber-go/ratelimit,或直接使用底层 `golang.org/x/time/rate` 的 `Wait(ctx)` / `Reserve()`.
 
 ---
 
@@ -24,7 +61,7 @@
 ### 日常验证(改完代码必跑)
 
 ```bash
-make release-check-all     # 三模块跑 vet + race + lint + vuln + sec + audit
+make release-check-all     # 两模块跑 vet + race + lint + vuln + sec + audit
 ```
 
 底层等价于:
@@ -34,10 +71,10 @@ bash scripts/run-all.sh release-check
 
 也支持单 target 跨模块:
 ```bash
-make all-vet       # 三模块各跑 go vet
-make all-test      # 三模块各跑 race 测试
-make all-lint      # 三模块各跑 golangci-lint + gofumpt
-make all-check     # 三模块各跑 govulncheck + gosec
+make all-vet       # 两模块各跑 go vet
+make all-test      # 两模块各跑 race 测试
+make all-lint      # 两模块各跑 golangci-lint + gofumpt
+make all-check     # 两模块各跑 govulncheck + gosec
 make audit         # 仓库级发版审计(检测哪些 module 需要发版)
 ```
 
@@ -50,13 +87,12 @@ make release       # 自动判定 + 按依赖顺序发所有需要发版的 modu
 发版流程:
 1. 检查工作区 clean(否则 abort)
 2. 跑 `scripts/check-modules.sh` 判定哪些 module 需要发版
-3. 按依赖顺序排:`.`(v1) → `v2` → `v2/gin`
+3. 按依赖顺序排:`.`(v1) → `v2`(两者互相独立)
 4. 每个待发模块自动:
    - 跑 `make release-check`(vet + race + lint + vuln + sec + audit 全套)
    - bump version.go 的 patch 号
    - commit + push HEAD
    - tag + push tag
-5. 发版 `v2` 后,若 `v2/gin` 也需要发版,**自动同步** `v2/gin/go.mod` 的 `require` 行指向新 v2 tag,再继续发 `v2/gin`
 
 ### 预演发版(dry-run)
 
@@ -84,8 +120,7 @@ cd v2 && make tag
 | Module | Tag 前缀 | 示例 |
 |---|---|---|
 | 根(v1) | `v` | `v1.0.5` |
-| v2 | `v2/v` | `v2/v2.1.0` |
-| v2/gin | `v2/gin/v` | `v2/gin/v2.0.0` |
+| v2 | `v2/v` | `v2/v2.2.0` |
 
 `scripts/check-modules.sh` 按此前缀分别审计每个 module,**互不干扰**.
 
@@ -138,7 +173,8 @@ v2 在 v1 之外,**额外提供**这些能力(适合复杂场景,与 v1 共存):
 - `float64` rps,支持 fractional rate
 - `Check(key) Result` 框架无关接口契约
 - `WithMaxKeys` 防键基数 DoS、`WithOnReject` metrics 接入
-- Gin 中间件(在 `v2/gin/` sub-module)
+- `Wait(ctx, key)` 阻塞式整流(平滑出口流量)
+- 框架接入示例(见 [`docs/gin.md`](./docs/gin.md))
 
 ## License
 

@@ -3,14 +3,33 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-仓库内有**三个**独立 Go module:
+仓库内有**两个**独立 Go module:
 - 根目录 `github.com/gtkit/golimit` — v1,全局单例 API,稳定维护
 - `v2/` 目录 `github.com/gtkit/golimit/v2` — v2 实例化 API,零第三方依赖
-- `v2/gin/` 目录 `github.com/gtkit/golimit/v2/gin` — v2 的 Gin 框架适配
+
+> 历史:早期还有 `v2/gin` 适配 module,自 v2.2.0 起移除(框架适配改为文档示例,见 `docs/gin.md`)。
 
 ---
 
 ## [Unreleased]
+
+## v2/v2.2.0 - 2026-06-16
+
+> ✨ 新增阻塞式整流 API `Wait`,补齐"超额排队等待"语义(对应 uber-go/ratelimit 的用途)。
+> 向后兼容,v2.1.x 用户可直接升级,零代码改动。
+
+### Added
+
+- **`(*Limiter).Wait(ctx, key) error`** —— `Allow` 的整流对应物:超额不拒绝而是阻塞等待令牌,支持 `context` 取消/超时。适合主动调用下游(API / DB / MQ)时把发送速率平滑摊开。底层复用 `golang.org/x/time/rate` 的 `Limiter.Wait`,per-key 隔离。
+- **`ErrMaxKeys`** 哨兵错误 —— `Wait` 在 `WithMaxKeys` 上限拒绝新 key 时返回,可用 `errors.Is(err, ErrMaxKeys)` 判定。
+
+### Notes
+
+- `Wait` 的取消语义遵循底层 `rate` 包:当 ctx deadline 早于令牌补充时间时会**提前**返回错误(不傻等到 deadline);等待中被 cancel 则返回 `context.Canceled`。
+
+### Removed
+
+- **移除 `v2/gin` 适配 module**。框架适配(此前的 `Middleware` / `IPLimit` / `PathIPLimit` / `UserLimit` / `Skip*` 等)改为**文档示例**(见 `docs/gin.md`),基于框架无关的 `Check` + `Result`,用户复制即用、不引入 gin 依赖。这让核心库回归纯粹的通用限流引擎,消除"一框架一 module"的版本/依赖维护负担。已发布的 `v2/gin@v2.0.0` 在 module proxy 中仍可用,但不再维护。
 
 ## v1.0.7 - 2026-05-26
 

@@ -60,21 +60,21 @@ gittag: ## 显示根模块最新 tag
 delcommit: ## 删除最近一次提交,但保留修改内容
 	git reset --soft HEAD~1
 
-# ================== 多模块(跨 v1 + v2 + v2/gin)自动化 target ==================
+# ================== 多模块(跨 v1 + v2)自动化 target ==================
 
-all-vet: ## 三模块 go vet
+all-vet: ## 两模块 go vet
 	bash scripts/run-all.sh vet
 
-all-test: ## 三模块 race 测试
+all-test: ## 两模块 race 测试
 	bash scripts/run-all.sh test
 
-all-lint: ## 三模块 golangci-lint + gofumpt
+all-lint: ## 两模块 golangci-lint + gofumpt
 	bash scripts/run-all.sh lint
 
-all-check: ## 三模块 govulncheck + gosec
+all-check: ## 两模块 govulncheck + gosec
 	bash scripts/run-all.sh check
 
-release-check-all: ## 三模块全套质量门(vet + race + lint + vuln + sec)+ advisory audit
+release-check-all: ## 两模块全套质量门(vet + race + lint + vuln + sec)+ advisory audit
 	bash scripts/run-all.sh release-check
 	@ echo ""
 	@ echo "📋 发版审计(advisory):"

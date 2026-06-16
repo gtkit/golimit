@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # scripts/check-modules.sh — 多 module 仓库发版审计
 #
-# 用途:本仓库内有三个独立 Go module,按全局规则 4-PRE 要求,
+# 用途:本仓库内有两个独立 Go module,按全局规则 4-PRE 要求,
 # 每次发版前必须自动检测每个模块"是否需要发版",避免漏发子模块。
 #
 #   - 根模块             github.com/gtkit/golimit          tag: vX.Y.Z(裸 tag)
 #   - v2 核心            github.com/gtkit/golimit/v2       tag: v2/vX.Y.Z
-#   - v2/gin 适配        github.com/gtkit/golimit/v2/gin   tag: v2/gin/vX.Y.Z
 #
 # 用法:
 #   bash scripts/check-modules.sh
@@ -27,9 +26,8 @@ fi
 
 # module 路径 → tag 前缀映射.
 declare -a MODULES=(
-    ".:v1"              # 根模块,tag 形如 v1.X.Y
-    "v2:v2/v2"          # v2 模块,tag 形如 v2/v2.X.Y
-    "v2/gin:v2/gin/v2"  # v2/gin 模块,tag 形如 v2/gin/v2.X.Y
+    ".:v1"      # 根模块,tag 形如 v1.X.Y
+    "v2:v2/v2"  # v2 模块,tag 形如 v2/v2.X.Y
 )
 
 NEED_RELEASE=0
@@ -49,8 +47,7 @@ for entry in "${MODULES[@]}"; do
 
     # 检查该 tag 之后该路径是否有变更.各模块互斥统计:
     #   - 根模块:排除 v2/ + scripts/ + .github/ + *.md
-    #   - v2 核心:仅 v2/ 下,但排除 v2/gin/(它是独立模块)
-    #   - v2/gin:仅 v2/gin/ 下
+    #   - v2 核心:仅 v2/ 下
     case "$dir" in
         .)
             changed=$(git diff --name-only "${latest_tag}..HEAD" -- \
@@ -59,11 +56,6 @@ for entry in "${MODULES[@]}"; do
             ;;
         v2)
             changed=$(git diff --name-only "${latest_tag}..HEAD" -- "v2" \
-                ':(exclude)v2/gin' \
-                | grep -E '\.go$|/go\.(mod|sum)$' || true)
-            ;;
-        *)
-            changed=$(git diff --name-only "${latest_tag}..HEAD" -- "$dir" \
                 | grep -E '\.go$|/go\.(mod|sum)$' || true)
             ;;
     esac
