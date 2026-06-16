@@ -21,7 +21,19 @@
 ### Added
 
 - **`(*Limiter).Wait(ctx, key) error`** —— `Allow` 的整流对应物:超额不拒绝而是阻塞等待令牌,支持 `context` 取消/超时。适合主动调用下游(API / DB / MQ)时把发送速率平滑摊开。底层复用 `golang.org/x/time/rate` 的 `Limiter.Wait`,per-key 隔离。
-- **`ErrMaxKeys`** 哨兵错误 —— `Wait` 在 `WithMaxKeys` 上限拒绝新 key 时返回,可用 `errors.Is(err, ErrMaxKeys)` 判定。
+- **`(*Limiter).WaitN(ctx, key, n) error`** —— `Wait` 的批量版,语义同 `Wait`;`n<=0` 立即返回 nil。
+- **`ErrMaxKeys`** 哨兵错误 —— `Wait` / `WaitN` 在 `WithMaxKeys` 上限拒绝新 key 时返回,可用 `errors.Is(err, ErrMaxKeys)` 判定。
+
+### Changed
+
+- **`Result.ResetAt` 改为反映真实补满时间**:此前固定 `now + 1s`,与"桶补满 burst 的时间"语义不符(rate=100/burst=50、rate=0.5 等都不准);现按 `(burst - remaining) / rate` 计算,写 `X-RateLimit-Reset` 头更准确。
+- 微优化:`Allow` / `AllowN` / `Check` 热路径合并重复的 `time.Now()`(一次 `now` 贯穿 `lastSeen` 与 `AllowN(now, …)`)。
+
+### Fixed
+
+- **`Close()` 幂等**:加 `sync.Once`,重复调用(`defer` + shutdown hook 常见)不再 panic。
+- **`WithMaxKeys` 改为硬上限**:此前 `size` 检查与 `LoadOrStore` 之间存在 check-then-act 竞态,高并发新 key 可冲破上限;现仅对"新 key 创建"路径加 `createMu` 串行(已有 key 仍走无锁 Load),`Size()` 严格不超 `maxKeys`。
+- **非有限 rps 兜底**:`New` 现在拦截 `NaN` / `±Inf`(此前 `rps <= 0` 拦不住),并对极大 rps 的 burst 推导封顶,确保"`New` 永不 panic"对异常输入也成立。
 
 ### Notes
 
@@ -30,6 +42,18 @@
 ### Removed
 
 - **移除 `v2/gin` 适配 module**。框架适配(此前的 `Middleware` / `IPLimit` / `PathIPLimit` / `UserLimit` / `Skip*` 等)改为**文档示例**(见 `docs/gin.md`),基于框架无关的 `Check` + `Result`,用户复制即用、不引入 gin 依赖。这让核心库回归纯粹的通用限流引擎,消除"一框架一 module"的版本/依赖维护负担。已发布的 `v2/gin@v2.0.0` 在 module proxy 中仍可用,但不再维护。
+
+## v1.0.8 - 2026-06-16
+
+> 🔒 并发正确性修复 + 微优化,对正常用法 API 与行为完全兼容,v1.0.7 可直接升级。
+
+### Fixed
+
+- **rps 热更新并发一致性**:同一 key 被多个 goroutine 并发传入不同 rps 时,此前 `SetLimit` / `SetBurst` / `rps` 缓存三者各自原子、组合不原子,可能来自不同"胜者"导致状态错乱(且错误缓存会让后续误判"无变化")。新增 `updateRPS` 把三者收进同一临界区,同 rps 热路径仍走 atomic load 免锁。
+
+### Changed
+
+- 微优化:`Allow` 合并重复的 `time.Now()`(一次 `now` 贯穿 `lastGet` 与 `AllowN(now, 1)`)。
 
 ## v1.0.7 - 2026-05-26
 

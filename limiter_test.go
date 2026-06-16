@@ -514,6 +514,39 @@ func TestCleanupRemovesIdleEntries(t *testing.T) {
 	}
 }
 
+// ================== 加固测试:rps 热更新并发一致性 ==================
+
+// TestRPSHotUpdate_ConcurrentConsistency 验证并发传不同 rps 时,最终 Limit/Burst/缓存 rps
+// 三者一致.修复前 SetLimit/SetBurst/rps.Store 各自原子但组合不原子,并发可能让三者来自
+// 不同"胜者"导致错乱;updateRPS 把三者收进同一临界区后恒一致.
+func TestRPSHotUpdate_ConcurrentConsistency(t *testing.T) {
+	ls := newTestLS()
+	const key = "consistency"
+	_ = ls.getLimiter(key, 1)
+
+	var wg sync.WaitGroup
+	for i := range 200 {
+		wg.Add(1)
+		go func(rps int) {
+			defer wg.Done()
+			ls.getLimiter(key, rps)
+		}(i%50 + 1) // rps 在 1..50.
+	}
+	wg.Wait()
+
+	v, _ := ls.entries.Load(key)
+	lim := v.(*Limiter)
+	gotLimit := int(float64(lim.limiter.Limit()))
+	gotBurst := lim.limiter.Burst()
+	gotRPS := int(lim.rps.Load())
+
+	// v1 把 rate 与 burst 绑定到同一 rps,三者必须相等.
+	if gotLimit != gotBurst || gotBurst != gotRPS {
+		t.Errorf("并发热更新后 Limit/Burst/缓存rps 应一致,实际 Limit=%d Burst=%d rps=%d.",
+			gotLimit, gotBurst, gotRPS)
+	}
+}
+
 // ================== Benchmark ==================
 
 // BenchmarkAllow_SingleKey 测量单 key 的吞吐(最坏争用场景).

@@ -52,7 +52,7 @@
 | 突发 | 允许(burst 容量) | 抑制(强制匀速) |
 | 典型位置 | 服务端入口 | 客户端出口 |
 
-> 提示:golimit 目前只提供**非阻塞**的 `Allow` / `Check`.若你需要"阻塞等待"式整流,请用 uber-go/ratelimit,或直接使用底层 `golang.org/x/time/rate` 的 `Wait(ctx)` / `Reserve()`.
+> 提示:v2 已同时提供**非阻塞**的 `Allow` / `Check`(超额即拒)和**阻塞式**的 `Wait(ctx, key)` / `WaitN`(超额排队等待、整流出口流量)——拒绝式与整流式两种范式,一个库都覆盖.
 
 ---
 

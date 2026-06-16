@@ -31,6 +31,9 @@ type Limiters struct {
 // Limiter 包装单个令牌桶,记录最后访问时间用于自动清理.
 type Limiter struct {
 	limiter *rate.Limiter
+	// mu 仅在 rps 变化时保护 SetLimit + SetBurst + rps 三者的一致更新,避免并发传不同
+	// rps 时三者来自不同"胜者"导致 Limit/Burst/缓存 rps 错乱.同 rps 热路径走 atomic,不加锁.
+	mu sync.Mutex
 	// rps 缓存当前配置的速率,使 getLimiter 命中已有 key 时的比较无需调用
 	// rate.Limiter.Limit()(后者加 mutex).atomic.Load + 整数比较 ~1 ns,
 	// 在"同 key 同 rps"的高频路径(如 Gin middleware 每请求 NewLimiter)
@@ -74,8 +77,27 @@ func NewLimiter(key string, rps int) *Limiter {
 // Allow 判断当前请求是否在限流额度内.
 // 并发安全,可以从任意数量的 goroutine 同时调用.
 func (l *Limiter) Allow() bool {
-	l.lastGet.Store(time.Now().UnixNano())
-	return l.limiter.Allow()
+	now := time.Now()
+	l.lastGet.Store(now.UnixNano())
+	return l.limiter.AllowN(now, 1)
+}
+
+// updateRPS 在 rps 变化时,把 SetLimit + SetBurst + rps 缓存作为一个临界区一致更新,
+// 避免并发传不同 rps 时三者交错、来自不同"胜者"导致 Limit/Burst/缓存 rps 不一致.
+// 同 rps(无变化)走 atomic load 快路径,不加锁.
+func (l *Limiter) updateRPS(rps int) {
+	if int(l.rps.Load()) == rps {
+		return // 快路径:无变化,免锁.
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// 双检查:等锁期间可能已被更新成相同值.
+	if int(l.rps.Load()) == rps {
+		return
+	}
+	l.limiter.SetLimit(rate.Limit(rps))
+	l.limiter.SetBurst(rps)
+	l.rps.Store(int64(rps))
 }
 
 // getLimiter 查找已有 Limiter 或原子地创建新实例.
@@ -91,13 +113,7 @@ func (ls *Limiters) getLimiter(key string, rps int) *Limiter {
 
 	if v, ok := ls.entries.Load(key); ok {
 		l := v.(*Limiter)
-		if int(l.rps.Load()) != rps {
-			// rps 真正变化才付 mutex 代价.SetLimit 与 SetBurst 都要 —
-			// v1 API 把 rate 与 burst 绑定到同一 rps 参数.
-			l.limiter.SetLimit(rate.Limit(rps))
-			l.limiter.SetBurst(rps)
-			l.rps.Store(int64(rps))
-		}
+		l.updateRPS(rps)
 		return l
 	}
 
@@ -113,13 +129,9 @@ func (ls *Limiters) getLimiter(key string, rps int) *Limiter {
 
 	if actual, loaded := ls.entries.LoadOrStore(key, l); loaded {
 		// 输给了另一个 goroutine 的 LoadOrStore — 拿到的实例可能是别人刚塞进去的,
-		// 其 rps 可能与本次入参不同.同步一次以保证"最后写入者胜出"的语义.
+		// 其 rps 可能与本次入参不同.updateRPS 一致同步,保证"最后写入者胜出"的语义.
 		existing := actual.(*Limiter)
-		if int(existing.rps.Load()) != rps {
-			existing.limiter.SetLimit(rate.Limit(rps))
-			existing.limiter.SetBurst(rps)
-			existing.rps.Store(int64(rps))
-		}
+		existing.updateRPS(rps)
 		return existing
 	}
 	return l

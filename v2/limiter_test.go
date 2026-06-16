@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -703,6 +704,96 @@ func TestCleanup_ActiveKeysSurvive(t *testing.T) {
 	}
 	if idleTok != float64(l.Burst()) {
 		t.Errorf("idle key should have been cleaned up and return full burst, got %f.", idleTok)
+	}
+}
+
+// ================== 加固测试:Close 幂等 / maxKeys 硬上限 / ResetAt / 非有限 rps / WaitN ==================
+
+// TestClose_Idempotent 验证 Close 多次调用不 panic(sync.Once 保护).
+func TestClose_Idempotent(t *testing.T) {
+	l := New(100)
+	l.Allow("k")
+	l.Close()
+	l.Close() // 第二次不应 panic.
+	l.Close() // 多次亦然.
+}
+
+// TestWithMaxKeys_HardLimitConcurrent 验证并发大量新 key 时 Size 不冲破 maxKeys(硬上限).
+// 修复前是 check-then-act 软上限,并发可超限;现在 createMu 串行新建,Size 严格 == maxKeys.
+func TestWithMaxKeys_HardLimitConcurrent(t *testing.T) {
+	const maxKeys = 50
+	l := New(1000, WithMaxKeys(maxKeys))
+	defer l.Close()
+
+	var wg sync.WaitGroup
+	for i := range 1000 { // 1000 个互不相同的新 key 并发创建,远超上限.
+		wg.Go(func() {
+			l.Allow(fmt.Sprintf("k-%d", i))
+		})
+	}
+	wg.Wait()
+
+	if got := l.Size(); got != maxKeys {
+		t.Errorf("并发新建后 Size 应被硬限制在 %d,实际 %d.", maxKeys, got)
+	}
+}
+
+// TestCheck_ResetAt 验证 ResetAt 反映"桶补满"的真实时间,而非旧实现的固定 1 秒.
+func TestCheck_ResetAt(t *testing.T) {
+	l := New(10, WithBurst(100)) // rate=10/s, burst=100.
+	defer l.Close()
+
+	for range 50 { // 耗掉约一半,制造明显 deficit.
+		l.Allow("k")
+	}
+	r := l.Check("k")
+	if !r.Allowed {
+		t.Fatal("应允许.")
+	}
+	// 剩 ~49,deficit ~51,补满需 ~5.1s — 远大于旧实现固定的 1s.用宽松下界避免 flaky.
+	if d := time.Until(r.ResetAt); d < 3*time.Second {
+		t.Errorf("ResetAt 应反映补满时间(约 5s),实际距现在仅 %v(像是固定 1s 的旧实现).", d)
+	}
+}
+
+// TestNew_NonFiniteRate 验证 NaN / ±Inf rps 不 panic、回退默认、行为正常.
+func TestNew_NonFiniteRate(t *testing.T) {
+	for _, rps := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					t.Errorf("New(%v) 不应 panic,实际 %v.", rps, rec)
+				}
+			}()
+			l := New(rps)
+			defer l.Close()
+			if l.Burst() < 1 {
+				t.Errorf("New(%v) 的 burst 应 >=1,实际 %d.", rps, l.Burst())
+			}
+			if !l.Allow("k") {
+				t.Errorf("New(%v) 回退默认后首请求应通过.", rps)
+			}
+		}()
+	}
+}
+
+// TestWaitN 验证 WaitN 基础行为 + n<=0 恒过 + maxKeys 硬拒.
+func TestWaitN(t *testing.T) {
+	l := New(100, WithBurst(10))
+	defer l.Close()
+
+	if err := l.WaitN(t.Context(), "k", 0); err != nil {
+		t.Errorf("WaitN(_,0) 应返回 nil,实际 %v.", err)
+	}
+	if err := l.WaitN(t.Context(), "k", 5); err != nil {
+		t.Errorf("WaitN(_,5) 在 burst=10 下应通过,实际 %v.", err)
+	}
+
+	l2 := New(100, WithMaxKeys(1))
+	defer l2.Close()
+	_ = l2.WaitN(t.Context(), "a", 1)
+	if err := l2.WaitN(t.Context(), "b", 1); !errors.Is(err, ErrMaxKeys) {
+		t.Errorf("超 maxKeys 时 WaitN 应返回 ErrMaxKeys,实际 %v.", err)
 	}
 }
 

@@ -77,8 +77,11 @@ type Limiter struct {
 
 	visitors sync.Map     // map[string]*visitor.
 	size     atomic.Int64 // 当前 sync.Map 中 key 数量,用于 WithMaxKeys 上限判定与 Size() 监控.
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	// createMu 仅串行化"新 key 创建"路径,使 WithMaxKeys 成为硬上限;已有 key 走无锁 Load.
+	createMu  sync.Mutex
+	stopCh    chan struct{}
+	closeOnce sync.Once // 保证 Close 幂等,重复调用不 panic.
+	wg        sync.WaitGroup
 
 	cleanupInterval time.Duration
 	maxIdleTime     time.Duration
@@ -97,6 +100,9 @@ type visitor struct {
 
 // ================== 构造 ==================
 
+// maxBurst 是 burst 的内部上限,防止极大 rps 推导出溢出 int 或荒谬的 burst.
+const maxBurst = 1 << 30 // ~10.7 亿,远超任何真实限流场景.
+
 // New 创建一个 Limiter,每个 key 每秒允许 rps 个请求.
 // 同时启动后台清理 goroutine,需调用 Close() 停止.
 //
@@ -108,18 +114,23 @@ type visitor struct {
 //	defer lim.Close()
 //
 // 所有 Option 的非法值都会被规范化为默认值,确保 New 永不 panic:
-//   - rps <= 0 → 100
+//   - rps 非有限(NaN / ±Inf)或 <= 0 → 100
 //   - burst <= 0 → max(1, ceil(rps))
 //   - cleanupInterval <= 0 → 1 分钟(避免 time.NewTicker(0) panic)
 //   - maxIdleTime <= 0 → 5 分钟
 //   - maxKeys < 0 → 0(等价于无上限)
 func New(rps float64, opts ...Option) *Limiter {
-	if rps <= 0 {
+	// 非有限(NaN / ±Inf)或非正数都回退默认,保证 New 永不 panic / 不进入异常状态.
+	if math.IsNaN(rps) || math.IsInf(rps, 0) || rps <= 0 {
 		rps = 100
 	}
 
-	// burst 至少为 1 — 避免 rps<1 时 int(rps)=0 导致全部请求被拒.
-	defaultBurst := max(1, int(math.Ceil(rps)))
+	// burst 至少为 1(避免 rps<1 时 int=0 全拒);对极大 rps 封顶,避免 int 溢出 / 荒谬 burst.
+	ceil := math.Ceil(rps)
+	if ceil > maxBurst {
+		ceil = maxBurst
+	}
+	defaultBurst := max(1, int(ceil))
 
 	l := &Limiter{
 		rate:            rps,
@@ -173,8 +184,9 @@ func (l *Limiter) Allow(key string) bool {
 		l.notify(key, RejectMaxKeys)
 		return false
 	}
-	v.lastSeen.Store(time.Now().UnixNano())
-	if !v.lim.Allow() {
+	now := time.Now()
+	v.lastSeen.Store(now.UnixNano())
+	if !v.lim.AllowN(now, 1) {
 		l.notify(key, RejectRate)
 		return false
 	}
@@ -192,8 +204,9 @@ func (l *Limiter) AllowN(key string, n int) bool {
 		l.notify(key, RejectMaxKeys)
 		return false
 	}
-	v.lastSeen.Store(time.Now().UnixNano())
-	if !v.lim.AllowN(time.Now(), n) {
+	now := time.Now()
+	v.lastSeen.Store(now.UnixNano())
+	if !v.lim.AllowN(now, n) {
 		l.notify(key, RejectRate)
 		return false
 	}
@@ -225,9 +238,8 @@ func (l *Limiter) Check(key string) Result {
 			Reason:     RejectMaxKeys,
 		}
 	}
-	v.lastSeen.Store(time.Now().UnixNano())
-
 	now := time.Now()
+	v.lastSeen.Store(now.UnixNano())
 	if !v.lim.AllowN(now, 1) {
 		l.notify(key, RejectRate)
 		return Result{
@@ -239,11 +251,12 @@ func (l *Limiter) Check(key string) Result {
 		}
 	}
 
+	remaining := v.lim.Tokens()
 	return Result{
 		Allowed:   true,
 		Limit:     l.burst,
-		Remaining: v.lim.Tokens(),
-		ResetAt:   now.Add(time.Second),
+		Remaining: remaining,
+		ResetAt:   now.Add(l.refillDuration(remaining)),
 	}
 }
 
@@ -273,6 +286,25 @@ func (l *Limiter) Wait(ctx context.Context, key string) error {
 	return v.lim.Wait(ctx)
 }
 
+// WaitN 阻塞直到 key 的限流器放行 n 个请求,或 ctx 被取消 / 超时.语义同 Wait.
+// n <= 0 时立即返回 nil(不阻塞).
+//
+// 注意:n 超过配置的 burst 时,底层 rate 包会立即返回错误(再久也放行不了 n 个),
+// 不会阻塞——调用方应保证 n <= burst.
+func (l *Limiter) WaitN(ctx context.Context, key string, n int) error {
+	if n <= 0 {
+		return nil
+	}
+	v := l.getOrCreate(key)
+	if v == nil {
+		l.notify(key, RejectMaxKeys)
+		return ErrMaxKeys
+	}
+	now := time.Now()
+	v.lastSeen.Store(now.UnixNano())
+	return v.lim.WaitN(ctx, n)
+}
+
 // Tokens 返回指定 key 当前的近似可用令牌数.
 // 若 key 此前从未见过,则返回 burst.
 func (l *Limiter) Tokens(key string) float64 {
@@ -293,7 +325,9 @@ func (l *Limiter) Reset(key string) {
 // Close 停止后台清理 goroutine 并等待其退出.
 // Close 返回后 Limiter 不应再被使用.
 func (l *Limiter) Close() {
-	close(l.stopCh)
+	l.closeOnce.Do(func() {
+		close(l.stopCh)
+	})
 	l.wg.Wait()
 }
 
@@ -346,18 +380,41 @@ func computeRetryAfter(rps float64) time.Duration {
 	return time.Duration(RetryAfterSeconds(rps)) * time.Second
 }
 
+// refillDuration 估算桶从当前剩余令牌补满到 burst 所需时间,用于 Result.ResetAt.
+// rate<=0 或已满时返回 0.
+func (l *Limiter) refillDuration(remaining float64) time.Duration {
+	if l.rate <= 0 {
+		return 0
+	}
+	deficit := float64(l.burst) - remaining
+	if deficit <= 0 {
+		return 0
+	}
+	return time.Duration(deficit / l.rate * float64(time.Second))
+}
+
 // ================== 内部实现 ==================
 
-// getOrCreate 查找已有 visitor 或原子地创建新实例.
-// 返回 nil 表示因 WithMaxKeys 上限被拒.
+// getOrCreate 查找已有 visitor 或创建新实例.返回 nil 表示因 WithMaxKeys 上限被拒.
+//
+// 已有 key 走无锁 sync.Map.Load 快路径;仅"新 key 创建"经 createMu 串行,把 maxKeys
+// 检查 + size 自增 + Store 收进同一临界区,使 WithMaxKeys 成为**硬上限**(而非
+// check-then-act 竞态下可被并发冲破的软上限).
 func (l *Limiter) getOrCreate(key string) *visitor {
+	// 快路径:已有 key,无锁.
 	if v, ok := l.visitors.Load(key); ok {
 		return v.(*visitor)
 	}
 
-	// 上限检查 — 先于实例化,避免无效分配.
-	// 注意:maxKeys 边界附近存在轻微竞态(多 goroutine 同时通过 size 检查后才 LoadOrStore),
-	// 但偏差有界(最多 N 个并发新建 goroutine),对 DoS 防护够用.
+	// 慢路径:新 key 创建串行化.
+	l.createMu.Lock()
+	defer l.createMu.Unlock()
+
+	// 双重检查:等锁期间可能已被其他 goroutine 创建.
+	if v, ok := l.visitors.Load(key); ok {
+		return v.(*visitor)
+	}
+	// 硬上限:检查与下面的 size.Add 同在锁内,不会被并发冲破.
 	if l.maxKeys > 0 && l.size.Load() >= int64(l.maxKeys) {
 		return nil
 	}
@@ -365,14 +422,10 @@ func (l *Limiter) getOrCreate(key string) *visitor {
 	v := &visitor{
 		lim: rate.NewLimiter(rate.Limit(l.rate), l.burst),
 	}
-	// 关键:创建时立即 Store lastSeen,否则 lastSeen=0 < threshold,
-	// 在首次 Allow 调用 v.lastSeen.Store 之前若 cleanup goroutine 抢先 Range,
-	// 新创建的 visitor 会被立即删除 → 后续请求重新创建,burst 重置,绕过限流.
+	// 创建时立即 Store lastSeen,否则 lastSeen=0 < threshold,会被 cleanup 误删
+	// (后续请求重新创建,burst 重置,绕过限流).
 	v.lastSeen.Store(time.Now().UnixNano())
-
-	if actual, loaded := l.visitors.LoadOrStore(key, v); loaded {
-		return actual.(*visitor)
-	}
+	l.visitors.Store(key, v)
 	l.size.Add(1)
 	return v
 }
