@@ -44,10 +44,11 @@ tag: release-check ## 升 patch 版本并打 tag(自动跑 release-check 质量�
 	git commit -m "chore(release): v2 $$new"; \
 	printf "Release: %s\n" "$$new"; \
 	git push gtkit HEAD; \
-	git tag -a "v2/$${new}" -m "release v2/$$new"; \
-	printf "Tag: v2/%s\n" "$$new"; \
-	git push gtkit "v2/$${new}"; \
+	git tag -a "$${new}" -m "release v2 $$new"; \
+	printf "Tag: %s\n" "$$new"; \
+	git push gtkit "$${new}"; \
 	printf "Done\n"
 
+# v2 tag 无 v2/ 前缀(module path 末尾 /v2 与子目录名重合,Go 要求裸 vX.Y.Z)。
 gittag: ## 显示 v2 最新 tag
-	git tag --sort=-version:refname | grep '^v2/' | head -1
+	git tag --sort=-version:refname | grep -E '^v2\.[0-9]' | head -1

@@ -54,8 +54,8 @@ tag: release-check ## 升 patch 版本并打 tag(自动跑 release-check 质量�
 	git push gtkit "$$new"; \
 	printf "Done\n"
 
-gittag: ## 显示根模块最新 tag
-	git tag --sort=-version:refname | grep -v '^v2/' | head -1
+gittag: ## 显示根模块(v1)最新 tag
+	git tag --sort=-version:refname | grep -E '^v1\.[0-9]' | head -1
 
 delcommit: ## 删除最近一次提交,但保留修改内容
 	git reset --soft HEAD~1

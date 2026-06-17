@@ -27,7 +27,7 @@ fi
 # module 路径 → tag 前缀映射.
 declare -a MODULES=(
     ".:v1"      # 根模块,tag 形如 v1.X.Y
-    "v2:v2/v2"  # v2 模块,tag 形如 v2/v2.X.Y
+    "v2:v2"  # v2 模块,tag 形如 v2.X.Y(无前缀;/v2 后缀与子目录名 v2 重合,Go 剥离前缀)
 )
 
 NEED_RELEASE=0
