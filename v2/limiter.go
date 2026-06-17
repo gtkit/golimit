@@ -55,7 +55,8 @@ type Result struct {
 	Remaining float64
 
 	// ResetAt 是桶下一次能补满 burst 的预估时间(仅当 Allowed=true 时填充).
-	// 用于 X-RateLimit-Reset 头(Unix 时间戳).
+	// 用于 X-RateLimit-Reset 头(Unix 时间戳).极端低速率(补满需 > 1 天)下会钳制到
+	// 1 天上限以避免 time.Duration 溢出 —— 此时为上限值、非数学精确补满时间.
 	ResetAt time.Time
 
 	// RetryAfter 当 Allowed=false 时,客户端建议等待多久后重试.

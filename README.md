@@ -24,10 +24,10 @@
 
 [uber-go/ratelimit](https://github.com/uber-go/ratelimit) 是另一个常见的 Go 限流库.两者都叫"限流",但解决的是**相反方向**的问题,不是竞品 —— 选错方向会用得很别扭:
 
-- **golimit** = 令牌桶 + **拒绝式**.保护**你自己这个服务端**不被打爆:超额**立即拒绝**(返回 429),不阻塞调用方.
-- **uber-go/ratelimit** = 漏桶 + **阻塞式**.保护**你要调用的下游**:超额**阻塞等待**,把请求匀速摊开发出去.
+- **golimit** = 令牌桶 + **per-key**,一个库给两种范式:拒绝式(`Allow`/`Check`,超额即拒、返回 429)与整流式(`Wait`/`WaitN`,超额阻塞排队).允许突发(burst).
+- **uber-go/ratelimit** = 漏桶 + **单一全局速率**,只做阻塞式整流,**严格匀速、不允许突发**.
 
-一句话:**入口防刷用 golimit,出口整流用 uber-go/ratelimit.**
+一句话:**入口防刷、per-key 整流用 golimit;要单一全局、严格匀速(无突发)的漏桶整流用 uber-go/ratelimit.**
 
 ### 按场景选
 
@@ -37,20 +37,20 @@
 | 按 IP / 用户 / 路径分别限流(per-key) | **golimit**(uber 不支持) |
 | 超额要返回 429 + `Retry-After` / `X-RateLimit-*` 头 | **golimit**(见 [`docs/gin.md`](./docs/gin.md)) |
 | 防伪造海量 key 耗内存的 DoS(`WithMaxKeys`) | **golimit**(uber 不支持) |
-| 主动调用下游 API / DB / MQ,要把发送速率平滑匀速 | **uber-go/ratelimit** |
-| 超额时希望**阻塞排队**而不是被拒绝 | **uber-go/ratelimit** |
-| 单一全局速率、强制匀速抑制突发 | **uber-go/ratelimit** |
+| 主动调下游、要 **per-key** 整流(每租户 / 每下游独立速率) | **golimit**(`Wait` / `WaitN`) |
+| 超额时希望**阻塞排队**而非被拒 | 两者皆可:golimit `Wait`(per-key)/ uber(全局) |
+| **单一全局**速率、严格匀速、**不允许突发** | **uber-go/ratelimit** |
 
 ### 关键差异速查
 
 | | golimit | uber-go/ratelimit |
 |---|---|---|
 | 算法 | 令牌桶(`x/time/rate`) | 漏桶(自研,零依赖) |
-| 行为 | 非阻塞,超额即拒 | 阻塞,超额即等 |
-| 核心 API | `Allow() bool` / `Check() Result` | `Take() time.Time` |
+| 范式 | 拒绝式 + 整流式(`Allow`/`Check` + `Wait`/`WaitN`) | 仅阻塞式整流 |
+| 核心 API | `Allow` / `Check` / `Wait` / `WaitN` | `Take() time.Time` |
 | per-key 隔离 | ✅ | ❌(单一速率) |
-| 突发 | 允许(burst 容量) | 抑制(强制匀速) |
-| 典型位置 | 服务端入口 | 客户端出口 |
+| 突发 | 允许(burst 容量) | 抑制(严格匀速) |
+| 典型位置 | 服务端入口 + 出口整流 | 客户端出口 |
 
 > 提示:v2 已同时提供**非阻塞**的 `Allow` / `Check`(超额即拒)和**阻塞式**的 `Wait(ctx, key)` / `WaitN`(超额排队等待、整流出口流量)——拒绝式与整流式两种范式,一个库都覆盖.
 
