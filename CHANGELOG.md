@@ -13,6 +13,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **v2:`Wait` / `WaitN` 在途等待不再被后台清理误删** —— 等待时长超过 `maxIdleTime` 时,空闲清理曾会回收该 key,导致同 key 的新请求重建满桶、绕过"同 key 平滑整流"语义。现以在途等待计数标记该 key,且**计数增减与 cleanup 删除都在 `createMu` 锁内**进行(cleanup 删除前二次确认 map value / 计数 / lastSeen),既跳过在途等待的 key,也杜绝 check-then-delete 竞态。
+- **v2:`RetryAfterSeconds` 对 `NaN` / 极小正 rps 不再返回负值** —— `NaN` 此前绕过守卫、极小正 rps 致 `ceil(1/rps)` 溢出 int(返回 `MinInt64`),会写出负的 `Retry-After`;现统一兜底 1 秒,并对秒数封顶 1 天。同时修正 `New(极小正 rps)` 预计算 `retryAfter` 为负的问题。
+- **v2:`Result.ResetAt` 对极小 rate 不再溢出到过去** —— `refillDuration` 的 `(burst-remaining)/rate` 秒数未钳制时,极小 rate(如 `1e-10`)会让 `float→Duration` 越界回绕成负值、`ResetAt` 落到过去;现复用 Retry-After 的 1 天上限钳制。
+
 ## v2/v2.2.0 - 2026-06-16
 
 > ✨ 新增阻塞式整流 API `Wait`,补齐"超额排队等待"语义(对应 uber-go/ratelimit 的用途)。

@@ -96,6 +96,10 @@ type Limiter struct {
 type visitor struct {
 	lim      *rate.Limiter
 	lastSeen atomic.Int64 // Unix 纳秒,原子更新,免锁.
+	// activeWaits 是当前阻塞在 Wait/WaitN 中的调用数,原子更新.
+	// >0 时 cleanup 必须跳过该 key:等待时长可能超过 maxIdleTime,若被回收,
+	// 同 key 的新请求会重建满桶,绕过"同 key 平滑整流"语义.
+	activeWaits atomic.Int64
 }
 
 // ================== 构造 ==================
@@ -273,17 +277,18 @@ func (l *Limiter) Check(key string) Result {
 //     context.DeadlineExceeded),或所需等待时间已超出 ctx deadline 时底层 rate 包
 //     提前返回的错误(不会傻等到 deadline).可用 errors.Is 判定具体类型.
 //
-// Wait 在阻塞期间持有 per-key 限流器的引用,即使该 key 在等待中被 cleanup 回收也不
-// 影响本次等待.因 Wait 是"等待而非拒绝"语义,令牌不足不触发 WithOnReject 回调;
-// 仅 ErrMaxKeys 这种硬拒绝会触发(reason=RejectMaxKeys).
+// 在途等待期间,cleanup 不会回收本 key(activeWaits 计数在 createMu 锁内维护、与 cleanup
+// 删除互斥),保证"同 key 平滑整流"不被自动清理打断.因 Wait 是"等待而非拒绝"语义,令牌
+// 不足不触发 WithOnReject 回调;仅 ErrMaxKeys 这种硬拒绝会触发(reason=RejectMaxKeys).
 func (l *Limiter) Wait(ctx context.Context, key string) error {
-	v := l.getOrCreate(key)
+	v := l.acquireForWait(key) // 锁内 activeWaits++,cleanup 不会再回收本 key.
 	if v == nil {
 		l.notify(key, RejectMaxKeys)
 		return ErrMaxKeys
 	}
+	defer l.releaseWait(v)
 	v.lastSeen.Store(time.Now().UnixNano())
-	return v.lim.Wait(ctx)
+	return v.lim.Wait(ctx) // 注意:不持锁阻塞.
 }
 
 // WaitN 阻塞直到 key 的限流器放行 n 个请求,或 ctx 被取消 / 超时.语义同 Wait.
@@ -295,14 +300,14 @@ func (l *Limiter) WaitN(ctx context.Context, key string, n int) error {
 	if n <= 0 {
 		return nil
 	}
-	v := l.getOrCreate(key)
+	v := l.acquireForWait(key) // 锁内 activeWaits++,cleanup 不会再回收本 key.
 	if v == nil {
 		l.notify(key, RejectMaxKeys)
 		return ErrMaxKeys
 	}
-	now := time.Now()
-	v.lastSeen.Store(now.UnixNano())
-	return v.lim.WaitN(ctx, n)
+	defer l.releaseWait(v)
+	v.lastSeen.Store(time.Now().UnixNano())
+	return v.lim.WaitN(ctx, n) // 注意:不持锁阻塞.
 }
 
 // Tokens 返回指定 key 当前的近似可用令牌数.
@@ -314,9 +319,13 @@ func (l *Limiter) Tokens(key string) float64 {
 	return float64(l.burst)
 }
 
-// Reset 移除指定 key 的限流状态.
-// 下一次请求会从满 burst 开始计数.
+// Reset 移除指定 key 的限流状态.下一次请求会从满 burst 开始计数.
+//
+// 走 createMu,与创建 / cleanup 在 size 维护上互斥,避免短暂计数不一致.
+// 注:Reset 是显式重置,即使该 key 有在途 Wait 也会清除(显式操作语义高于 cleanup 的自动保护).
 func (l *Limiter) Reset(key string) {
+	l.createMu.Lock()
+	defer l.createMu.Unlock()
 	if _, loaded := l.visitors.LoadAndDelete(key); loaded {
 		l.size.Add(-1)
 	}
@@ -362,17 +371,28 @@ func (l *Limiter) FormatBurst() string {
 
 // ================== Helpers(供框架适配层使用) ==================
 
-// RetryAfterSeconds 根据 rps 计算合理的 Retry-After 秒数.
-// rps >= 1 → 1 秒(下一秒一定会补一个令牌);rps < 1 → ceil(1/rps),如 rps=0.1 返回 10.
-// rps <= 0(异常)→ 1 秒兜底.
+// maxRetryAfterSeconds 是 Retry-After 的内部上限(1 天).
+//  1. 防止极小正 rps 让 ceil(1/rps) 溢出 int —— float→int 越界在 Go 里是实现相关的
+//     (amd64 给 MinInt64,会得到负的 Retry-After);
+//  2. 超过一天的 Retry-After 对客户端已无实际意义.
+const maxRetryAfterSeconds = 24 * 60 * 60
+
+// RetryAfterSeconds 根据 rps 计算合理的 Retry-After 秒数,返回值恒为正整数.
+// rps >= 1(含 +Inf)→ 1 秒(下一秒一定会补一个令牌);rps < 1 → ceil(1/rps),如 rps=0.1 返回 10;
+// rps <= 0 / NaN(异常)→ 1 秒兜底;极小正 rps 致 ceil 超上限 → 钳制为 maxRetryAfterSeconds.
 //
 // 这是**框架适配层公用**的辅助函数,exported 出来避免每个中间件重新发明.
 // 参数命名为 rps 而非 rate,避免遮蔽 golang.org/x/time/rate 包名.
 func RetryAfterSeconds(rps float64) int {
-	if rps <= 0 || rps >= 1 {
+	// NaN 的所有比较都为 false,必须显式拦,否则会落到下面 int(Ceil) 触发越界负值.
+	if math.IsNaN(rps) || rps <= 0 || rps >= 1 {
 		return 1
 	}
-	return int(math.Ceil(1.0 / rps))
+	secs := math.Ceil(1.0 / rps)
+	if secs > maxRetryAfterSeconds {
+		return maxRetryAfterSeconds
+	}
+	return int(secs)
 }
 
 // computeRetryAfter 把 RetryAfterSeconds 的结果转为 time.Duration,在 Check 拒绝路径用.
@@ -390,7 +410,13 @@ func (l *Limiter) refillDuration(remaining float64) time.Duration {
 	if deficit <= 0 {
 		return 0
 	}
-	return time.Duration(deficit / l.rate * float64(time.Second))
+	secs := deficit / l.rate
+	// 钳制:极小 rate 会让 secs 巨大,float→Duration(int64 纳秒)越界会回绕成负值
+	// (ResetAt 落到过去).复用 Retry-After 的 1 天上限.
+	if secs > maxRetryAfterSeconds {
+		secs = maxRetryAfterSeconds
+	}
+	return time.Duration(secs * float64(time.Second))
 }
 
 // ================== 内部实现 ==================
@@ -405,29 +431,53 @@ func (l *Limiter) getOrCreate(key string) *visitor {
 	if v, ok := l.visitors.Load(key); ok {
 		return v.(*visitor)
 	}
-
 	// 慢路径:新 key 创建串行化.
 	l.createMu.Lock()
 	defer l.createMu.Unlock()
+	return l.getOrCreateLocked(key)
+}
 
-	// 双重检查:等锁期间可能已被其他 goroutine 创建.
+// getOrCreateLocked 假定调用方已持有 createMu.查找已有 visitor 或创建新实例,把 maxKeys
+// 检查 + Store + size.Add 收进锁内,使 WithMaxKeys 成为硬上限.返回 nil 表示因上限被拒.
+//
+// 抽出"已持锁"版本是为了让 getOrCreate(快路径无锁)与 acquireForWait(全程持锁)复用同一
+// 创建逻辑,又不会因重复 Lock 同一把不可重入的 createMu 而死锁.
+func (l *Limiter) getOrCreateLocked(key string) *visitor {
 	if v, ok := l.visitors.Load(key); ok {
 		return v.(*visitor)
 	}
-	// 硬上限:检查与下面的 size.Add 同在锁内,不会被并发冲破.
 	if l.maxKeys > 0 && l.size.Load() >= int64(l.maxKeys) {
 		return nil
 	}
-
 	v := &visitor{
 		lim: rate.NewLimiter(rate.Limit(l.rate), l.burst),
 	}
-	// 创建时立即 Store lastSeen,否则 lastSeen=0 < threshold,会被 cleanup 误删
-	// (后续请求重新创建,burst 重置,绕过限流).
+	// 创建时立即 Store lastSeen,否则 lastSeen=0 < threshold 会被 cleanup 误删.
 	v.lastSeen.Store(time.Now().UnixNano())
 	l.visitors.Store(key, v)
 	l.size.Add(1)
 	return v
+}
+
+// acquireForWait 供 Wait / WaitN 使用:在 createMu 锁内获取/创建 visitor 并 activeWaits++.
+// 把"标记在途等待"与 cleanup 的删除收进同一把锁,杜绝 check-then-delete 竞态——cleanup
+// 锁内会二次确认 activeWaits==0,故此处 ++ 之后它绝不会回收该 key.返回 nil 表示因上限被拒.
+func (l *Limiter) acquireForWait(key string) *visitor {
+	l.createMu.Lock()
+	defer l.createMu.Unlock()
+	v := l.getOrCreateLocked(key)
+	if v != nil {
+		v.activeWaits.Add(1)
+	}
+	return v
+}
+
+// releaseWait 在 Wait / WaitN 结束时调用:先刷新 lastSeen 再减 activeWaits.
+// 顺序关键 —— 任何观察到 activeWaits==0 的时刻 lastSeen 都已刷新为 now,cleanup 的
+// "lastSeen 过期"二次确认因此不会误删一个刚结束等待的 key.无需持锁(均为原子操作).
+func (l *Limiter) releaseWait(v *visitor) {
+	v.lastSeen.Store(time.Now().UnixNano())
+	v.activeWaits.Add(-1)
 }
 
 // notify 在 onReject 已注册时安全调用回调.
@@ -453,17 +503,29 @@ func (l *Limiter) cleanupLoop() {
 	}
 }
 
-// cleanup 移除空闲超过 maxIdleTime 的 visitor.
+// cleanup 移除空闲超过 maxIdleTime 的 visitor.有在途 Wait/WaitN 的 key 一律不回收
+// (等待可能长于 maxIdleTime,删除会让同 key 新请求重建满桶、绕过整流).
 func (l *Limiter) cleanup() {
 	threshold := time.Now().Add(-l.maxIdleTime).UnixNano()
 
 	l.visitors.Range(func(key, value any) bool {
 		v := value.(*visitor)
-		if v.lastSeen.Load() < threshold {
-			if _, loaded := l.visitors.LoadAndDelete(key); loaded {
-				l.size.Add(-1)
-			}
+		// 无锁预筛:绝大多数 key 不满足回收条件,直接跳过,避免无谓加锁.
+		if v.activeWaits.Load() != 0 || v.lastSeen.Load() >= threshold {
+			return true
 		}
+		// 候选回收:进 createMu 二次确认后再删,与 acquireForWait / getOrCreate 互斥.
+		// 三个条件缺一不可:
+		//   - 当前 map value 仍是同一个 v(否则会误删刚被 Reset + 重建的新 visitor);
+		//   - activeWaits 仍为 0(否则有 Wait 在预筛后、加锁前进来了);
+		//   - lastSeen 仍过期(否则有请求 / Wait 结束刚刷新了它).
+		l.createMu.Lock()
+		if cur, ok := l.visitors.Load(key); ok && cur == value &&
+			v.activeWaits.Load() == 0 && v.lastSeen.Load() < threshold {
+			l.visitors.Delete(key)
+			l.size.Add(-1)
+		}
+		l.createMu.Unlock()
 		return true
 	})
 }

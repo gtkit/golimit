@@ -99,6 +99,7 @@ r.Use(func(c *gin.Context) {
 | `(*Limiter).AllowN(key string, n int) bool` | 检查 n 个请求(`n<=0` 恒 true) |
 | `(*Limiter).Check(key string) Result` | **信息丰富**版本,返回 Result(供中间件写头) |
 | `(*Limiter).Wait(ctx, key string) error` | **阻塞式整流**:超额排队等待而非拒绝,支持 ctx 取消 |
+| `(*Limiter).WaitN(ctx, key string, n int) error` | `Wait` 的批量版(`n<=0` 恒过) |
 | `(*Limiter).Tokens(key string) float64` | 当前可用令牌数 |
 | `(*Limiter).Reset(key string)` | 重置指定 key 的限流状态 |
 | `(*Limiter).Size() int64` | 当前缓存的 key 数(运维监控) |

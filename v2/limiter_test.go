@@ -797,6 +797,21 @@ func TestWaitN(t *testing.T) {
 	}
 }
 
+// TestCheck_ResetAt_NoOverflow 验证极小 rate 下允许路径的 ResetAt 不会因 refillDuration
+// 的 (burst-remaining)/rate 越界、回绕成过去时间(钳制到 maxRetryAfterSeconds 上限).
+func TestCheck_ResetAt_NoOverflow(t *testing.T) {
+	l := New(1e-10, WithBurst(1)) // 极小 rate:补满时间未钳制时会溢出 time.Duration.
+	defer l.Close()
+
+	r := l.Check("k") // 首次满桶,允许,填 ResetAt.
+	if !r.Allowed {
+		t.Fatal("首次 Check 应允许(满桶)")
+	}
+	if !r.ResetAt.After(time.Now()) {
+		t.Errorf("极小 rate 下 ResetAt 不应溢出到过去,实际 %v", r.ResetAt)
+	}
+}
+
 // ================== Benchmark ==================
 
 func BenchmarkAllow_SingleKey(b *testing.B) {
@@ -828,4 +843,98 @@ func BenchmarkAllow_MultiKey(b *testing.B) {
 			i++
 		}
 	})
+}
+
+// ================== 回归:Wait 期间不被 cleanup 误删 ==================
+
+// TestWaitNotCleanedDuringWait 验证:当 Wait 阻塞时长超过 maxIdleTime 时,
+// 该 key 不会被 cleanup 回收(否则同 key 新请求会重建满桶,绕过整流).
+// 修复前:Wait 只在进入前刷新一次 lastSeen,cleanup 只看 lastSeen,会删掉正在等待的 key.
+// 修复后:visitor.activeWaits>0 时 cleanup 跳过.
+func TestWaitNotCleanedDuringWait(t *testing.T) {
+	// rate=1/burst=1:排干 1 个令牌后,下一次 Wait 需阻塞约 1s,远超 50ms 的 idle.
+	l := New(1,
+		WithBurst(1),
+		WithCleanupInterval(10*time.Millisecond),
+		WithMaxIdleTime(50*time.Millisecond),
+	)
+	defer l.Close()
+
+	if !l.Allow("k") { // 排干唯一令牌,使随后的 Wait 必然阻塞.
+		t.Fatal("首个请求应被允许(满桶)")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- l.Wait(ctx, "k") }()
+
+	// 跨越多个 cleanup 周期(且远超 maxIdleTime):若无 activeWaits 保护,key 早被删,Size 归零.
+	time.Sleep(200 * time.Millisecond)
+	if got := l.Size(); got != 1 {
+		t.Fatalf("Wait 阻塞期间 Size = %d,want 1(key 不应被 cleanup 回收)", got)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Wait 最终应成功获得令牌,实际 err = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait 未在预期时间内返回")
+	}
+}
+
+// ================== 回归:RetryAfterSeconds 边界输入 ==================
+
+// TestRetryAfterSeconds_EdgeCases 覆盖 NaN / ±Inf / 极小正数 / 负数 / 0 等边界,
+// 确保返回值恒为正整数,不再因 float→int 越界返回 MinInt64 负值.
+func TestRetryAfterSeconds_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name string
+		rps  float64
+		want int
+	}{
+		{"normal_fraction", 0.1, 10},
+		{"just_below_one", 0.5, 2},
+		{"ge_one", 100, 1},
+		{"exactly_one", 1, 1},
+		{"zero", 0, 1},
+		{"negative", -5, 1},
+		{"nan", math.NaN(), 1},
+		{"pos_inf", math.Inf(1), 1},
+		{"neg_inf", math.Inf(-1), 1},
+		{"tiny_denormal", 5e-324, maxRetryAfterSeconds},
+		{"tiny_1e_300", 1e-300, maxRetryAfterSeconds},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RetryAfterSeconds(tc.rps)
+			if got < 0 {
+				t.Fatalf("RetryAfterSeconds(%v) = %d,绝不应为负", tc.rps, got)
+			}
+			if got != tc.want {
+				t.Fatalf("RetryAfterSeconds(%v) = %d,want %d", tc.rps, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNewTinyRPSRetryAfterNotNegative 验证 New(极小正 rps) 预计算的 retryAfter
+// 不再是负值(此前 computeRetryAfter 经 RetryAfterSeconds 溢出得到负 Duration).
+func TestNewTinyRPSRetryAfterNotNegative(t *testing.T) {
+	l := New(1e-300, WithBurst(1))
+	defer l.Close()
+
+	_ = l.Check("k")  // 消耗唯一令牌.
+	r := l.Check("k") // 无令牌 → 拒绝,Result.RetryAfter 取预计算值.
+	if r.Allowed {
+		t.Fatal("第二次 Check 应被拒(桶已空)")
+	}
+	if r.RetryAfter < 0 {
+		t.Fatalf("RetryAfter = %v,不应为负", r.RetryAfter)
+	}
+	if want := time.Duration(maxRetryAfterSeconds) * time.Second; r.RetryAfter != want {
+		t.Fatalf("RetryAfter = %v,want %v(钳制上限)", r.RetryAfter, want)
+	}
 }
